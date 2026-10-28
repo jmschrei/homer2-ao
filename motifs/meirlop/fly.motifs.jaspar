@@ -1,0 +1,90 @@
+>bcd(Homeobox)/Embryo-Bcd-ChIP-Seq(GSE86966)/Homer	bcd(Homeobox)/Embryo-Bcd-ChIP-Seq(GSE86966)/Homer
+A  [   343    302    217    205      1    696      1      1    816    313    227    239 ]
+C  [   229    189    298     80      1    302      1     68      1    120    281    246 ]
+G  [   252    292    279    629    997      1      1      1      1    326    298    246 ]
+T  [   176    217    206     86      1      1    997    930    182    240    195    269 ]
+>caudal(Homeobox)/Drosophila-Embryos-ChIP-Chip(modEncode)/Homer	caudal(Homeobox)/Drosophila-Embryos-ChIP-Chip(modEncode)/Homer
+A  [   232    245     22    209    725      1    980    947    954    446 ]
+C  [   134    148    539    756     21      1      1      1     42    129 ]
+G  [   474    606     21     28    245      2     12      4      3    121 ]
+T  [   160      1    418      7      9    996      7     48      1    304 ]
+>CTCF(Zf)/WholeFly-dCTCF-ChIP-seq(GSE175402)/Homer	CTCF(Zf)/WholeFly-dCTCF-ChIP-seq(GSE175402)/Homer
+A  [   288    111    245    133      1      1    155     22    800     44     88     66    557     67     67    177    111    332    156    599 ]
+C  [   222     89     89     67    955     22    757    911    177    333    801      1     22    111    489    111    133    289    400    111 ]
+G  [   401    222    578    778      1    911     44      1     22     44      1     44    332    489    178    645    600    156    222    201 ]
+T  [    89    578     88     22     43     66     44     66      1    579    110    889     89    333    266     67    156    223    222     89 ]
+>dHNF4(NR)/Fly-HNF4-ChIP-Seq(GSE73675)/Homer	dHNF4(NR)/Fly-HNF4-ChIP-Seq(GSE73675)/Homer
+A  [   222      1     55    110      1    889    944    997      1     55      1      1    832    443    166 ]
+C  [    57      1      1    445    944    109      1      1      1      1    554    889      1    332    222 ]
+G  [   666    888    165    222      1      1      1      1    944    111     57     55    112    114    167 ]
+T  [    55    110    779    223     54      1     54      1     54    833    388     55     55    111    445 ]
+>Dorsal(RHD)/Embryo-dl-ChIP-Seq(GSE65441)/Homer	Dorsal(RHD)/Embryo-dl-ChIP-Seq(GSE65441)/Homer
+A  [   104     85    259    774    933    753    627    297    145     96    187    287 ]
+C  [   129     65     59      1     19     47     50    445    710    694    542    145 ]
+G  [   608    795    657    176     12     19     48     73     62    116    164    464 ]
+T  [   159     55     25     49     36    181    275    186     83     94    107    104 ]
+>DREF/Drosophila-Promoters/Homer	DREF/Drosophila-Promoters/Homer
+A  [   436    335    230    155    934      4     10     11    954     27    654    290 ]
+C  [   120    208    405    113     12     10    980      5     18     32     19     79 ]
+G  [   216    297    104     17     15     20      1    983     11      7    129    370 ]
+T  [   229    161    261    715     39    966      9      1     17    934    198    261 ]
+>E-box/Drosophila-Promoters/Homer	E-box/Drosophila-Promoters/Homer
+A  [   560    493     21    957     83     68     24      1    304     38    208    244 ]
+C  [   168    117    971      5     11    850      1      1     72    218    254    197 ]
+G  [   225     96      7      3    880      7      3    981    128    145    192    332 ]
+T  [    47    295      1     35     26     75    972     17    496    599    346    226 ]
+>Trl(Zf)/S2-GAGAfactor-ChIP-Seq(GSE40646)/Homer	Trl(Zf)/S2-GAGAfactor-ChIP-Seq(GSE40646)/Homer
+A  [   379    240    899     58    835      1    456    197 ]
+C  [   103     10      1     14    114      1    259     39 ]
+G  [   412    749     99    918     50    997    285    763 ]
+T  [   107      1      1     10      1      1      1      1 ]
+>Initiator/Drosophila-Promoters/Homer	Initiator/Drosophila-Promoters/Homer
+A  [   261      1      1    921     85     49    110    156 ]
+C  [   230     48    976      1      1     72    471    192 ]
+G  [   211     70     22     77    855      1      1    440 ]
+T  [   297    881      1      1     59    878    418    212 ]
+>Unknown1(NR/Ini-like)/Drosophila-Promoters/Homer	Unknown1(NR/Ini-like)/Drosophila-Promoters/Homer
+A  [   391     48     36      1      1    174    958      1    804      1     38    317 ]
+C  [   262    467      2      1    277    824     17    920      7    889    185     50 ]
+G  [   239     49    935    962     55      1     20      1      8      1      7    518 ]
+T  [   109    436     27     36    667      1      5     78    181    109    770    115 ]
+>M1BP(Zf)/S2R+-M1BP-ChIP-Seq(GSE49842)/Homer	M1BP(Zf)/S2R+-M1BP-ChIP-Seq(GSE49842)/Homer
+A  [   141    879     38     93     58     21     11    828     33      2    364     68 ]
+C  [   583     11      2     13      1      6      1     48    955    972     31    216 ]
+G  [    51     93    958     10    940     31    955    122      5      5    579    189 ]
+T  [   225     17      2    884      1    942     33      2      7     21     26    527 ]
+>TATA-box/Drosophila-Promoters/Homer	TATA-box/Drosophila-Promoters/Homer
+A  [    37      1    997      1    997    713    997    997    279    129    187    224 ]
+C  [   557      1      1      1      1      1      1      1      1    527    426    280 ]
+G  [   405      1      1      1      1      1      1      1    688    280    281    349 ]
+T  [     1    997      1    997      1    285      1      1     32     64    106    147 ]
+>Unknown2/Drosophila-Promoters/Homer	Unknown2/Drosophila-Promoters/Homer
+A  [     1    997    270      1    573      1      1    890 ]
+C  [   997      1      1    997    425    997      1      1 ]
+G  [     1      1     86      1      1      1      1    108 ]
+T  [     1      1    643      1      1      1    997      1 ]
+>Unknown3/Drosophila-Promoters/Homer	Unknown3/Drosophila-Promoters/Homer
+A  [   434    179    349    828     29      1      1      1      1      1    997    418      1    133      1 ]
+C  [   184    642    290      7      1    491      1      1      1    997      1      1    997    209    984 ]
+G  [   261     54    334    164    499    258      1    997    997      1      1    574      1    484      1 ]
+T  [   121    125     27      1    471    251    997      1      1      1      1      7      1    175     14 ]
+>Unknown4/Drosophila-Promoters/Homer	Unknown4/Drosophila-Promoters/Homer
+A  [   522    668    965    629    993      1    974      1      1    536    370    456 ]
+C  [     1      1      1     35      1      1     24    913    625      1    245    180 ]
+G  [   245    115      1     14      5      1      1      1      1    462    179    145 ]
+T  [   232    216     33    322      1    997      1     85    373      1    206    219 ]
+>Unknown5/Drosophila-Promoters/Homer	Unknown5/Drosophila-Promoters/Homer
+A  [   271     45      6      1    653      3    993    879     61    302 ]
+C  [    64    607    348      1      1      1      1      1    476    314 ]
+G  [   481    149     40    997     66    121      1    119    462    275 ]
+T  [   184    199    606      1    280    875      5      1      1    109 ]
+>Unknown6/Drosophila-Promoters/Homer	Unknown6/Drosophila-Promoters/Homer
+A  [   513    604    351      1      1    126    599    983    997    594 ]
+C  [    78     88      1      1      7    288     85     15      1     53 ]
+G  [   166      1      1      1      1    136    201      1      1      1 ]
+T  [   243    307    647    997    991    451    115      1      1    352 ]
+>Zelda(Zf)/Embryo-zld-ChIP-Seq(GSE65441)/Homer	Zelda(Zf)/Embryo-zld-ChIP-Seq(GSE65441)/Homer
+A  [    77     86      1      1    997      1      1      1      1    381 ]
+C  [   152    315    888      1      1    997    997      1      1    115 ]
+G  [   422    356      1      1      1      1      1      1    997    136 ]
+T  [   349    243    110    997      1      1      1    997      1    368 ]

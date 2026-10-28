@@ -1,0 +1,1 @@
+compareMotifs.pl m dbouput/ -dbview -dbTable motifTable.txt -cpu 50 -homer2
