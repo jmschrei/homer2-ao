@@ -23,12 +23,17 @@
 #include <cerrno>
 #include <condition_variable>
 #include <mutex>
+#include <new>
+#include <stdint.h>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+// 2^51: room for the error of rounded count totals below 2^52.
+#define COUNT_SUMS_EXACT_LIMIT 2251799813685248.0
 
 int Motif::alphaSize = DNA_ALPHA;
 char* Motif::alphaIndex = NULL;
@@ -578,6 +583,7 @@ DeNovoMotifs::~DeNovoMotifs() {
 	if (seedOligos != NULL) delete []seedOligos;
 	if (scorer != NULL) delete scorer;
 	if (fullSequences != NULL) delete fullSequences;
+	freeScreenResults();
 	// fill this in later
 }
 void DeNovoMotifs::freeOligos() {
@@ -638,7 +644,21 @@ void DeNovoMotifs::init() {
 	motifOptimizationMethod = MOTIF_OPTIMZATION_DIFFERENT_THRESHOLDS;
 	
 	maxAutoNormIters = MAX_OLIGO_NORMALIZATION_ITERATIONS;
-	
+
+	screenOligos = NULL;
+	numScreenOligos = 0;
+	screenBallFlag = 0;
+	savedScreenOligos = NULL;
+	trialCuts = NULL;
+	savedScreenValues = NULL;
+	savedScreenFlag2 = NULL;
+	numSavedScreen = 0;
+	savedSums = NULL;
+	savedSumValid = NULL;
+	savedCodes = NULL;
+	sumPasses = 0;
+	rescreenSumsFlag = 0;
+	markKeyBlocks = 0;
 }
 
 
@@ -836,6 +856,26 @@ void DeNovoMotifs::readSequence2Tree() {
 	double totalTargetOligos = 0.0;
 	double totalBackgroundOligos = 0.0;
 
+	// DNA oligos of 1-32 bases: the cleaned sequences are kept, and
+	// addSequenceWindows adds their windows' oligos after the loop.
+	int windowFast = (alphaSize == DNA_ALPHA && oligoLength >= 1 && oligoLength <= 32
+				&& totalLength < (long long)UINT32_MAX && numOligoEstimate < (unsigned long long)INT_MAX);
+	std::vector<char> windowText;
+	std::vector<uint32_t> windowSeqStart;
+	std::vector<int> windowSeqLen;
+	std::vector<uint64_t> windowGoodStart(1, 0);
+	std::vector<double> windowPv, windowNv;
+	if (windowFast) {
+		// reserved once, so no buffer is freed into the heap before the oligos
+		// are allocated, which keeps their allocations where HOMER v5.1 puts them
+		windowText.reserve(totalLength);
+		windowSeqStart.reserve(totalSequences);
+		windowSeqLen.reserve(totalSequences);
+		windowGoodStart.reserve(totalSequences+1);
+		windowPv.reserve(totalSequences);
+		windowNv.reserve(totalSequences);
+	}
+
 	rewind(fp);	
 
 	//now read in for real
@@ -880,13 +920,24 @@ void DeNovoMotifs::readSequence2Tree() {
 		int length = strlen(seq);
 
 		double numberOfGoodOligos = 0.0;
-		for (int i=0;i<=length-(int)oligoLength;i++) {
-			char tmp = seq[i+oligoLength];
-			seq[i+oligoLength]='\0';
-			char* oligo = &(seq[i]);
-			int ok = checkSequence(oligo);
-			if (ok) numberOfGoodOligos += 1.0;
-			seq[i+oligoLength]=tmp;
+		long long numGood = 0;
+		if (windowFast) {
+			// the cleaned sequence holds only ACGTN: a window is good when it holds no N
+			int run = 0;
+			for (int i=0;i<length;i++) {
+				run = (seq[i] == 'N') ? 0 : run+1;
+				if (run >= (int)oligoLength) numGood++;
+			}
+			numberOfGoodOligos = (double)numGood;
+		} else {
+			for (int i=0;i<=length-(int)oligoLength;i++) {
+				char tmp = seq[i+oligoLength];
+				seq[i+oligoLength]='\0';
+				char* oligo = &(seq[i]);
+				int ok = checkSequence(oligo);
+				if (ok) numberOfGoodOligos += 1.0;
+				seq[i+oligoLength]=tmp;
+			}
 		}
 		if (numberOfGoodOligos < 1.0) {
 			continue;
@@ -898,6 +949,22 @@ void DeNovoMotifs::readSequence2Tree() {
 		if (numberOfGoodOligos > avgSeqLength) {
 			pvalue *= avgSeqLength/numberOfGoodOligos;
 			nvalue *= avgSeqLength/numberOfGoodOligos;
+		}
+		if (windowFast) {
+			windowSeqStart.push_back((uint32_t)windowText.size());
+			windowText.insert(windowText.end(), seq, seq+length);
+			windowSeqLen.push_back(length);
+			windowGoodStart.push_back(windowGoodStart.back()+(uint64_t)numGood);
+			windowPv.push_back(pvalue);
+			windowNv.push_back(nvalue);
+			// the totals addOligo and this loop sum, one window at a time
+			for (long long k=0;k<numGood;k++) {
+				oligoArray->totalTarget += pvalue;
+				oligoArray->totalBackground += nvalue;
+				totalTargetOligos += pvalue;
+				totalBackgroundOligos += nvalue;
+			}
+			continue;
 		}
 		for (int i=0;i<=length-(int)oligoLength;i++) {
 			char tmp = seq[i+oligoLength];
@@ -913,6 +980,13 @@ void DeNovoMotifs::readSequence2Tree() {
 			seq[i+oligoLength]=tmp;
 		}
 		
+	}
+	// before fclose, as the loop's addOligo calls are: the oligos are allocated
+	// with the file's buffer still held
+	if (windowFast && windowSeqLen.size() > 0) {
+		totalOligos += oligoArray->addSequenceWindows(windowText.data(), (int)windowSeqLen.size(),
+				windowSeqStart.data(), windowSeqLen.data(), windowGoodStart.data(),
+				windowPv.data(), windowNv.data(), (int)numCPUs);
 	}
 	fprintf(stderr, "\n");
 	fclose(fp);
@@ -1002,12 +1076,46 @@ ThreadArgs_findMisMatchEnrichmentThread::ThreadArgs_findMisMatchEnrichmentThread
 
 void DeNovoMotifs::findMisMatchEnrichment(int maxMisMatches,FILE* fp,int verboseLevel) {
 	//oligoArray->resetOligoArray(); not needed with "activeOligos"
-	int inc = (int)(((double)oligoArray->numActiveOligos)/80.0);
-	int lastCheckedTotal = (int)oligoArray->numActiveOligos;
+	screenOligos = oligoArray->activeOligos;
+	numScreenOligos = oligoArray->numActiveOligos;
+	screenBallFlag = 1;
+	screenMisMatches(maxMisMatches,verboseLevel);
+	screenBallFlag = 0;
+	oligoArray->sortActiveOligos();
+	if (fp != NULL) {
+		fprintf(fp, "OligoSequence\tTarget Occurences\tBackground Occurences\tEnrichment(ln p, up to %d mismatches)\n",
+					maxMisMatches);
+		for (int i=0;i<oligoArray->numActiveOligos;i++) {
+			fprintf(fp, "%s\t%.1lf\t%.1lf\t%.3lf\n",oligoArray->activeOligos[i]->seq,oligoArray->activeOligos[i]->numTarget,
+					oligoArray->activeOligos[i]->numBackground,oligoArray->activeOligos[i]->value);
+		}
+	}
+}
+
+// The 0..maxMisMatches screen of screenOligos[0..numScreenOligos). Each oligo's
+// result (value, flag2) depends only on its own state, which
+// initializeOligoPvalues resets, and the counts of the tree's oligos within
+// maxMisMatches of it on either strand.
+void DeNovoMotifs::screenMisMatches(int maxMisMatches,int verboseLevel) {
+	int inc = (int)(((double)numScreenOligos)/80.0);
+	int lastCheckedTotal = numScreenOligos;
+	int tableReady = oligoArray->prepareCodeTable(maxMisMatches);
+	// The first screen may answer passes 1..maxMisMatches from mismatch-ball
+	// sums (OligoArray::buildBallSums), which the scorer reads only through
+	// its unsigned int truncations: binomial and hypergeometric, not zscore.
+	int ballCandidate = screenBallFlag && tableReady
+				&& (scoringMethod == MOTIF_SCORING_BINOMIAL || scoringMethod == MOTIF_SCORING_HYPERGEOMETRIC);
+	long long lastPassChecked = numScreenOligos;
 	if (verboseLevel != HOMER_VERBOSE_LEVEL0) {
 		fprintf(stderr, "\n\tGlobal Optimization Phase: Looking for enriched oligos with up to %d mismatches...\n",maxMisMatches);
 	}
 	for (int j=0;j<=maxMisMatches;j++) {
+		if (ballCandidate && j >= 1) {
+			ballCandidate = 0;
+			if (oligoArray->ballSumsWorthBuilding(maxMisMatches, j, lastPassChecked)) {
+				oligoArray->buildBallSums(maxMisMatches, (int)numCPUs);
+			}
+		}
 		if (verboseLevel != HOMER_VERBOSE_LEVEL0) {
 			fprintf(stderr, "\n\tScreening oligos %d (allowing %d mismatches):\n", oligoArray->numOligos, j);
 			fprintf(stderr, "\t|0%%                                   50%%                                  100%%|\n");
@@ -1022,8 +1130,8 @@ void DeNovoMotifs::findMisMatchEnrichment(int maxMisMatches,FILE* fp,int verbose
 
 		
 		pthread_mutex_init(&mutex, NULL);
-		mutexIndex = 0;
-		mutexTotal = oligoArray->numActiveOligos;
+		screenNext.store(0);
+		mutexTotal = numScreenOligos;
 		nextMeter = inc;
 		incMeter = inc;
 		ThreadArgs_findMisMatchEnrichmentThread** args = new ThreadArgs_findMisMatchEnrichmentThread*[numCPUs];
@@ -1056,26 +1164,527 @@ void DeNovoMotifs::findMisMatchEnrichment(int maxMisMatches,FILE* fp,int verbose
 
 		if (verboseLevel != HOMER_VERBOSE_LEVEL0) {
 			fprintf(stderr, "\n\t\t%.2lf%% skipped, %.2lf%% checked (%d of %d), of those checked:\n", 
-					(100.0*numSkipped)/oligoArray->numActiveOligos,
-					(100.0*totalChecked)/oligoArray->numActiveOligos,
-					totalChecked, oligoArray->numActiveOligos);
+					(100.0*numSkipped)/numScreenOligos,
+					(100.0*totalChecked)/numScreenOligos,
+					totalChecked, numScreenOligos);
 			fprintf(stderr, "\t\t%.2lf%% not in target, %.2lf%% increased p-value, %.2lf%% high p-value\n", 
-					(100.0*dueToTargetTags)/oligoArray->numActiveOligos, 
-					(100.0*dueToLessThanLast)/oligoArray->numActiveOligos,
-					(dueToLowPvalue*100.0)/oligoArray->numActiveOligos);
+					(100.0*dueToTargetTags)/numScreenOligos, 
+					(100.0*dueToLessThanLast)/numScreenOligos,
+					(dueToLowPvalue*100.0)/numScreenOligos);
 		}
 		inc = (int)(((double)lastChecked)/80.0);
 		lastCheckedTotal = lastChecked;
+		lastPassChecked = totalChecked;
 	}
-	oligoArray->sortActiveOligos();
-	if (fp != NULL) {
-		fprintf(fp, "OligoSequence\tTarget Occurences\tBackground Occurences\tEnrichment(ln p, up to %d mismatches)\n",
-					maxMisMatches);
-		for (int i=0;i<oligoArray->numActiveOligos;i++) {
-			fprintf(fp, "%s\t%.1lf\t%.1lf\t%.3lf\n",oligoArray->activeOligos[i]->seq,oligoArray->activeOligos[i]->numTarget,
-					oligoArray->activeOligos[i]->numBackground,oligoArray->activeOligos[i]->value);
+	oligoArray->dropBallSums();
+}
+
+static int encodeOligo2bit(const char* seq, int len, int reverse, unsigned long long &code);
+static int neighbourCount(int len, int m, int cap);
+
+// savedSumValid: bit j-1 for pass j's stored sums, this bit for savedCodes.
+#define SAVED_CODE_BIT 0x80
+#define MAX_STORED_SUM_PASSES 7
+
+// Stores each active oligo's screen result where local optimization, which
+// rewrites value, cannot reach it. Called right after a screen and its sort.
+// Stored sums and codes move with their oligos to the new slots.
+void DeNovoMotifs::saveScreenResults() {
+	int n = oligoArray->numActiveOligos;
+	int P = sumPasses;
+	int len = oligoArray->oligoLength;
+	Oligo** oligos = new Oligo*[n > 0 ? n : 1];
+	double* values = new double[n > 0 ? n : 1];
+	char* flag2 = new char[n > 0 ? n : 1];
+	double* sums = NULL;
+	unsigned char* valid = NULL;
+	unsigned long long* codes = NULL;
+	if (P > 0) {
+		sums = new double[(size_t)(n > 0 ? n : 1)*P*4];
+		valid = new unsigned char[n > 0 ? n : 1];
+		codes = new unsigned long long[n > 0 ? n : 1];
+	}
+	for (int i=0;i<n;i++) {
+		Oligo* o = oligoArray->activeOligos[i];
+		oligos[i] = o;
+		if (P > 0) valid[i] = 0;
+		if (o == NULL) continue;
+		values[i] = o->value;
+		flag2[i] = o->flag2;
+		if (P > 0) {
+			int old = o->screenSlot;
+			if (savedSums != NULL && old >= 0 && old < numSavedScreen && savedScreenOligos[old] == o) {
+				memcpy(sums + (size_t)i*P*4, savedSums + (size_t)old*P*4, sizeof(double)*4*P);
+				valid[i] = savedSumValid[old];
+				codes[i] = savedCodes[old];
+			} else if (len <= 32 && encodeOligo2bit(o->seq, len, 0, codes[i])) {
+				valid[i] = SAVED_CODE_BIT;
+			}
+		}
+		o->screenSlot = i;
+	}
+	freeScreenResults();
+	savedScreenOligos = oligos;
+	savedScreenValues = values;
+	savedScreenFlag2 = flag2;
+	savedSums = sums;
+	savedSumValid = valid;
+	savedCodes = codes;
+	numSavedScreen = n;
+}
+
+void DeNovoMotifs::freeScreenResults() {
+	if (savedScreenOligos != NULL) delete []savedScreenOligos;
+	if (savedScreenValues != NULL) delete []savedScreenValues;
+	if (savedScreenFlag2 != NULL) delete []savedScreenFlag2;
+	if (savedSums != NULL) delete []savedSums;
+	if (savedSumValid != NULL) delete []savedSumValid;
+	if (savedCodes != NULL) delete []savedCodes;
+	savedScreenOligos = NULL;
+	savedScreenValues = NULL;
+	savedScreenFlag2 = NULL;
+	savedSums = NULL;
+	savedSumValid = NULL;
+	savedCodes = NULL;
+	numSavedScreen = 0;
+}
+
+// Whether the re-screens keep each active oligo's mismatch sums (savedSums):
+// full masking, a scorer that reads the sums only through their unsigned int
+// truncations, the code table built, and every count finite and >= 0.
+// Call before the first saveScreenResults.
+void DeNovoMotifs::setupStoredSums() {
+	dropStoredSums();
+	if (maskMethod != DENOVO_MASK_FULL || oligoArray == NULL) return;
+	if (scoringMethod != MOTIF_SCORING_BINOMIAL && scoringMethod != MOTIF_SCORING_HYPERGEOMETRIC) return;
+	if (maxMisMatches < 1 || maxMisMatches > MAX_STORED_SUM_PASSES) return;
+	if (oligoArray->codeTableState != 1 || oligoArray->records == NULL || oligoArray->oligoLength > 32) return;
+	oligoArray->scanCountSums();
+	if (!oligoArray->countsUsable) return;
+	sumPasses = maxMisMatches;
+	oligoArray->snapContributions = 1;
+}
+
+void DeNovoMotifs::dropStoredSums() {
+	sumPasses = 0;
+	rescreenSumsFlag = 0;
+	if (oligoArray != NULL) oligoArray->snapContributions = 0;
+	if (savedSums != NULL) delete []savedSums;
+	if (savedSumValid != NULL) delete []savedSumValid;
+	if (savedCodes != NULL) delete []savedCodes;
+	savedSums = NULL;
+	savedSumValid = NULL;
+	savedCodes = NULL;
+}
+
+// Pass `pass` of the screen for o from its stored sums: returns 1 with vt and
+// vbg set to the unsigned int truncations of the sums sumMisMatchCounts would
+// return and above to (their sum > minimumCountsToStartSkipping), when the
+// stored sums are valid and their bounds decide all three; 0 otherwise.
+// HOMER v5.1's sum is within sumErr*exact of the exact sum, which is within
+// the stored bound of the stored sum.
+int DeNovoMotifs::storedSums(Oligo* o, int pass, double& vt, double& vbg, int& above) {
+	int slot = o->screenSlot;
+	if (pass < 1 || pass > sumPasses || savedSums == NULL || slot < 0 || slot >= numSavedScreen
+				|| savedScreenOligos[slot] != o || !(savedSumValid[slot] & (1 << (pass-1)))) return 0;
+	const double* c = savedSums + ((size_t)slot*sumPasses + pass-1)*4;
+	double t = c[0];
+	double g = c[1];
+	double et = c[2] + sumErrT[pass]*(t + c[2]);
+	double eg = c[3] + sumErrBg[pass]*(g + c[3]);
+	if (!(t >= 0.0 && g >= 0.0 && et >= 0.0 && eg >= 0.0)) return 0;
+	if (et == 0.0 && eg == 0.0) {
+		// the sums are HOMER v5.1's
+		if (!(t < 2147483648.0 && g < 2147483648.0)) return 0;
+		vt = floor(t);
+		vbg = floor(g);
+		above = (t+g > minimumCountsToStartSkipping);
+		return 1;
+	}
+	double tlo = t-et;
+	double thi = t+et;
+	double glo = g-eg;
+	double ghi = g+eg;
+	if (tlo < 0.0) tlo = 0.0;
+	if (glo < 0.0) glo = 0.0;
+	if (!(thi < 2147483648.0 && ghi < 2147483648.0)) return 0;
+	double ft = floor(tlo);
+	double fg = floor(glo);
+	if (floor(thi) != ft || floor(ghi) != fg) return 0;
+	double minCounts = minimumCountsToStartSkipping;
+	double shi = thi+ghi;
+	double slo = tlo+glo;
+	double margin = 4.0*DBL_EPSILON*(shi + fabs(minCounts));
+	if (shi + margin < minCounts) {
+		above = 0;
+	} else if (slo - margin > minCounts + 8.0*DBL_EPSILON*fabs(minCounts)) {
+		above = 1;
+	} else {
+		return 0;
+	}
+	vt = ft;
+	vbg = fg;
+	return 1;
+}
+
+// Keeps the sums sumMisMatchCounts returned for o's pass `pass`.
+void DeNovoMotifs::storeSums(Oligo* o, int pass, double vt, double vbg) {
+	int slot = o->screenSlot;
+	if (pass < 1 || pass > sumPasses || savedSums == NULL || slot < 0 || slot >= numSavedScreen
+				|| savedScreenOligos[slot] != o) return;
+	double* c = savedSums + ((size_t)slot*sumPasses + pass-1)*4;
+	c[0] = vt;
+	c[1] = vbg;
+	c[2] = sumErrT[pass]*fabs(vt);
+	c[3] = sumErrBg[pass]*fabs(vbg);
+	savedSumValid[slot] |= (unsigned char)(1 << (pass-1));
+}
+
+// The screen after a mask, where HOMER v5.1 re-screens every active oligo: an
+// oligo with no changed oligo (oligoArray->changedOligos) within maxMisMatches
+// on either strand sums the same counts in the same order as in the last
+// screen, so it gets its saved result back; the others are screened again.
+// initializeOligoPvalues must have run since the mask.
+void DeNovoMotifs::rescreenAfterMask(int maxMisMatches) {
+	int n = oligoArray->numActiveOligos;
+	Oligo** active = oligoArray->activeOligos;
+	char* dirty = new char[n > 0 ? n : 1];
+	if (sumPasses > 0 && (!oligoArray->countsUsable || maxMisMatches != sumPasses)) dropStoredSums();
+	if (savedScreenOligos == NULL || !markRescreenOligos(dirty, maxMisMatches)) {
+		for (int i=0;i<n;i++) dirty[i] = 1;
+		if (savedSumValid != NULL) {
+			for (int i=0;i<numSavedScreen;i++) savedSumValid[i] &= SAVED_CODE_BIT;
 		}
 	}
+	if (sumPasses > 0) {
+		double strands = oligoArray->rvFlag ? 2.0 : 1.0;
+		for (int j=1;j<=sumPasses;j++) {
+			double nterms = (double)neighbourCount(oligoArray->oligoLength, j, INT_MAX-1)*strands;
+			double k = (nterms + 8.0)*DBL_EPSILON;
+			sumErrT[j] = oligoArray->countsExactT ? 0.0 : k;
+			sumErrBg[j] = oligoArray->countsExactBg ? 0.0 : k;
+		}
+		rescreenSumsFlag = 1;
+	}
+	Oligo** list = new Oligo*[n > 0 ? n : 1];
+	int numList = 0;
+	for (int i=0;i<n;i++) {
+		Oligo* o = active[i];
+		if (!dirty[i] && o != NULL && o->screenSlot >= 0 && o->screenSlot < numSavedScreen
+					&& savedScreenOligos[o->screenSlot] == o) {
+			o->value = savedScreenValues[o->screenSlot];
+			o->flag2 = savedScreenFlag2[o->screenSlot];
+		} else {
+			list[numList++] = o;
+		}
+	}
+	delete []dirty;
+	screenOligos = list;
+	numScreenOligos = numList;
+	screenMisMatches(maxMisMatches,HOMER_VERBOSE_LEVEL0);
+	rescreenSumsFlag = 0;
+	screenOligos = NULL;
+	numScreenOligos = 0;
+	delete []list;
+	oligoArray->sortActiveOligos();
+	oligoArray->clearChangedOligos();
+	saveScreenResults();
+}
+
+// 2-bit code of an A/C/G/T oligo of length <= 32, base i in bits 2i..2i+1;
+// returns 0 for any other character.
+static int encodeOligo2bit(const char* seq, int len, int reverse, unsigned long long &code) {
+	code = 0;
+	for (int i=0;i<len;i++) {
+		char c = reverse ? seq[len-1-i] : seq[i];
+		unsigned long long b;
+		switch (c) {
+			case 'A': b = 0; break;
+			case 'C': b = 1; break;
+			case 'G': b = 2; break;
+			case 'T': b = 3; break;
+			default: return 0;
+		}
+		if (reverse) b = 3-b;
+		code |= b << (2*i);
+	}
+	return 1;
+}
+
+static inline int countMarkedFields(uint64_t m);
+
+// Whether m, with set bits at even positions only, has at most k of them.
+static inline int atMostMarked(unsigned long long m, int k) {
+	for (int i=0;i<k && m;i++) m &= m-1;
+	return m == 0;
+}
+
+// At most this many blocks per key in markRescreenOligos.
+#define MARK_MAX_KEY_BLOCKS 4
+// A bucket lookup's cost in candidate tests, for choosing how many.
+#define MARK_LOOKUP_COST 8.0
+
+// Expected lookups and tests per active oligo in markRescreenOligos with keys
+// cut from r of mis+r blocks: every r-subset's key holds up to maxKeyBases of
+// its blocks' bases, and its bucket numCodes/4^bases candidates.
+static double markKeyCost(int len, int mis, int r, int maxKeyBases, int numCodes) {
+	int nb = mis+r;
+	int comb[MARK_MAX_KEY_BLOCKS];
+	for (int i=0;i<r;i++) comb[i] = i;
+	double cost = 0.0;
+	for (;;) {
+		int bases = 0;
+		for (int i=0;i<r;i++) bases += ((comb[i]+1)*len)/nb - (comb[i]*len)/nb;
+		if (bases > maxKeyBases) bases = maxKeyBases;
+		cost += MARK_LOOKUP_COST + (double)numCodes/(double)(1LL << (2*bases));
+		int i = r-1;
+		while (i >= 0 && comb[i] == nb-r+i) i--;
+		if (i < 0) break;
+		comb[i]++;
+		for (int j=i+1;j<r;j++) comb[j] = comb[j-1]+1;
+	}
+	return cost;
+}
+
+// Sets dirty[i] for each active oligo within maxMisMatches of a changed oligo
+// or of its reverse complement (with rvFlag), the oligos whose sums
+// searchOligo would change. With sumPasses, also adds to each valid stored
+// sum (savedSums) the change in contribution of every changed oligo it holds:
+// pass j's sum holds an oligo once when it is within j mismatches of the
+// active oligo or of its reverse complement. Pigeonhole filter: cut into
+// maxMisMatches+r position blocks, any pair within maxMisMatches has r equal
+// blocks, so each r blocks' leading bases (at most 10 in all) index the
+// changed oligos' codes, and a candidate counts only under its first r equal
+// blocks. Returns 0 when it cannot decide, so the caller screens everything
+// and drops the stored sums.
+int DeNovoMotifs::markRescreenOligos(char* dirty, int maxMisMatches) {
+	int n = oligoArray->numActiveOligos;
+	int len = oligoArray->oligoLength;
+	if (maxMisMatches < 0 || len > 32 || len < maxMisMatches+1) return 0;
+	int nchanged = oligoArray->numChangedOligos;
+	int strands = oligoArray->rvFlag ? 2 : 1;
+	int numCodes = nchanged*strands;
+	for (int i=0;i<n;i++) dirty[i] = 0;
+	if (numCodes == 0) return 1;
+	int P = (sumPasses > 0 && sumPasses == maxMisMatches && savedSums != NULL) ? sumPasses : 0;
+
+	unsigned long long* codes = new unsigned long long[numCodes];
+	for (int i=0;i<nchanged;i++) {
+		for (int s=0;s<strands;s++) {
+			if (!encodeOligo2bit(oligoArray->changedOligos[i]->seq,len,s,codes[i*strands+s])) {
+				delete []codes;
+				return 0;
+			}
+		}
+	}
+	// Each changed oligo's contribution now minus before its first change.
+	double* delta = NULL;
+	if (P > 0) {
+		delta = new double[2*(size_t)nchanged];
+		for (int i=0;i<nchanged;i++) {
+			const double* snap = oligoArray->changedSnap + 2*(size_t)i;
+			double t, g;
+			if (!oligoArray->oligoContribution(oligoArray->changedOligos[i], t, g)
+						|| snap[0] != snap[0] || snap[1] != snap[1]) {
+				delete []delta;
+				delete []codes;
+				return 0;
+			}
+			delta[2*i] = t - snap[0];
+			delta[2*i+1] = g - snap[1];
+		}
+	}
+
+	// About 2 keys a code, at most 10 bases
+	int maxKeyBases = 1;
+	while (maxKeyBases < 10 && (1LL << (2*maxKeyBases)) < 2LL*numCodes) maxKeyBases++;
+
+	int r = markKeyBlocks;
+	if (r < 1 || r > MARK_MAX_KEY_BLOCKS || maxMisMatches+r > len || maxMisMatches > 8) {
+		r = 1;
+		double best = -1.0;
+		for (int c=1;c<=MARK_MAX_KEY_BLOCKS && maxMisMatches+c <= len && (c == 1 || maxMisMatches <= 8);c++) {
+			double cost = markKeyCost(len, maxMisMatches, c, maxKeyBases, numCodes);
+			if (best < 0.0 || cost < best) {
+				best = cost;
+				r = c;
+			}
+		}
+	}
+	int numBlocks = maxMisMatches+r;
+
+	const unsigned long long lowBits = 0x5555555555555555ULL;
+	int* blockStart = new int[numBlocks+1];
+	for (int b=0;b<=numBlocks;b++) blockStart[b] = (b*len)/numBlocks;
+	unsigned long long* blockBits = new unsigned long long[numBlocks];
+	for (int b=0;b<numBlocks;b++) {
+		int bases = blockStart[b+1]-blockStart[b];
+		unsigned long long m = (bases >= 32) ? ~0ULL : ((1ULL << (2*bases))-1);
+		blockBits[b] = (m << (2*blockStart[b])) & lowBits;
+	}
+	int numGroups = 1;
+	for (int i=0;i<r;i++) numGroups = numGroups*(numBlocks-i)/(i+1);
+	const int R = MARK_MAX_KEY_BLOCKS;
+	// the group's blocks, and every block up to its last
+	unsigned long long* groupBits = new unsigned long long[numGroups];
+	unsigned long long* groupUpTo = new unsigned long long[numGroups];
+	int* keyShift = new int[numGroups*R];
+	int* keyOffset = new int[numGroups*R];
+	unsigned long long* keyMask = new unsigned long long[numGroups*R];
+	int** bucketStart = new int*[numGroups];
+	unsigned long long** bucketCodes = new unsigned long long*[numGroups];
+	int** bucketIndex = new int*[numGroups];
+	int comb[MARK_MAX_KEY_BLOCKS];
+	for (int i=0;i<r;i++) comb[i] = i;
+	for (int g=0;g<numGroups;g++) {
+		// up to maxKeyBases leading bases of the r blocks, spread evenly
+		int take[MARK_MAX_KEY_BLOCKS];
+		int left = maxKeyBases;
+		for (int i=0;i<r;i++) take[i] = 0;
+		for (int more=1;more && left > 0;) {
+			more = 0;
+			for (int i=0;i<r && left > 0;i++) {
+				if (take[i] < blockStart[comb[i]+1]-blockStart[comb[i]]) {
+					take[i]++;
+					left--;
+					more = 1;
+				}
+			}
+		}
+		int bits = 0;
+		groupBits[g] = 0;
+		groupUpTo[g] = (2ULL << comb[r-1])-1;
+		for (int i=0;i<r;i++) {
+			groupBits[g] |= 1ULL << comb[i];
+			keyShift[g*R+i] = 2*blockStart[comb[i]];
+			keyMask[g*R+i] = (1ULL << (2*take[i]))-1;
+			keyOffset[g*R+i] = bits;
+			bits += 2*take[i];
+		}
+		int numBuckets = 1 << bits;
+		int* start = new int[numBuckets+1];
+		for (int k=0;k<=numBuckets;k++) start[k] = 0;
+		unsigned int* keys = new unsigned int[numCodes];
+		for (int i=0;i<numCodes;i++) {
+			unsigned long long key = 0;
+			for (int q=0;q<r;q++) key |= ((codes[i] >> keyShift[g*R+q]) & keyMask[g*R+q]) << keyOffset[g*R+q];
+			keys[i] = (unsigned int)key;
+			start[key+1]++;
+		}
+		for (int k=0;k<numBuckets;k++) start[k+1] += start[k];
+		int* fill = new int[numBuckets];
+		for (int k=0;k<numBuckets;k++) fill[k] = start[k];
+		unsigned long long* sorted = new unsigned long long[numCodes];
+		int* sortedIndex = new int[numCodes];
+		for (int i=0;i<numCodes;i++) {
+			sorted[fill[keys[i]]] = codes[i];
+			sortedIndex[fill[keys[i]]++] = i;
+		}
+		delete []fill;
+		delete []keys;
+		bucketStart[g] = start;
+		bucketCodes[g] = sorted;
+		bucketIndex[g] = sortedIndex;
+		// next r-subset in lexicographic order
+		int i = r-1;
+		while (i >= 0 && comb[i] == numBlocks-r+i) i--;
+		if (i < 0) break;
+		comb[i]++;
+		for (int j=i+1;j<r;j++) comb[j] = comb[j-1]+1;
+	}
+
+	const int exactT = oligoArray->countsExactT;
+	const int exactBg = oligoArray->countsExactBg;
+	Oligo** active = oligoArray->activeOligos;
+	int ok = 1;
+	for (int i=0;i<n;i++) {
+		Oligo* o = active[i];
+		if (o == NULL) {
+			ok = 0;
+			break;
+		}
+		unsigned long long code = 0;
+		unsigned int validBits = 0;
+		double* sums = NULL;
+		int slot = -1;
+		if (P > 0) {
+			// saveScreenResults put active oligo i in slot i
+			if (i < numSavedScreen && savedScreenOligos[i] == o) {
+				slot = i;
+			} else if (o->screenSlot >= 0 && o->screenSlot < numSavedScreen
+						&& savedScreenOligos[o->screenSlot] == o) {
+				slot = o->screenSlot;
+			}
+		}
+		if (slot >= 0 && (savedSumValid[slot] & SAVED_CODE_BIT)) {
+			code = savedCodes[slot];
+			validBits = savedSumValid[slot] & ~SAVED_CODE_BIT;
+			sums = savedSums + (size_t)slot*P*4;
+		} else if (!encodeOligo2bit(o->seq,len,0,code)) {
+			ok = 0;
+			break;
+		}
+		for (int g=0;g<numGroups;g++) {
+			unsigned long long key = 0;
+			for (int q=0;q<r;q++) key |= ((code >> keyShift[g*R+q]) & keyMask[g*R+q]) << keyOffset[g*R+q];
+			int end = bucketStart[g][key+1];
+			for (int j=bucketStart[g][key];j<end;j++) {
+				unsigned long long d = code ^ bucketCodes[g][j];
+				d = (d | (d >> 1)) & lowBits;
+				if (!atMostMarked(d, maxMisMatches)) continue;
+				if (validBits == 0) {
+					dirty[i] = 1;
+					break;
+				}
+				// counted only under its first r equal blocks
+				unsigned long long equal = 0;
+				for (int b=0;b<numBlocks;b++) equal |= (unsigned long long)((d & blockBits[b]) == 0) << b;
+				if ((equal & groupUpTo[g]) != groupBits[g]) continue;
+				int m = countMarkedFields(d);
+				int ci = bucketIndex[g][j];
+				int c = ci;
+				if (strands == 2) {
+					c = ci >> 1;
+					unsigned long long d2 = code ^ codes[ci ^ 1];
+					d2 = (d2 | (d2 >> 1)) & lowBits;
+					int m2 = countMarkedFields(d2);
+					// within reach of both strands: counted once, under the forward one
+					if ((ci & 1) && m2 <= maxMisMatches) continue;
+					if (m2 < m) m = m2;
+				}
+				dirty[i] = 1;
+				double dt = delta[2*c];
+				double dg = delta[2*c+1];
+				for (int p=(m > 1 ? m : 1);p<=P;p++) {
+					if (!(validBits & (1u << (p-1)))) continue;
+					double* s4 = sums + (p-1)*4;
+					s4[0] += dt;
+					s4[1] += dg;
+					if (!exactT) s4[2] += DBL_EPSILON*(fabs(s4[0]) + fabs(dt));
+					if (!exactBg) s4[3] += DBL_EPSILON*(fabs(s4[1]) + fabs(dg));
+				}
+			}
+			if (validBits == 0 && dirty[i]) break;
+		}
+	}
+	if (delta != NULL) delete []delta;
+	delete []codes;
+	for (int g=0;g<numGroups;g++) {
+		delete [](bucketStart[g]);
+		delete [](bucketCodes[g]);
+		delete [](bucketIndex[g]);
+	}
+	delete []bucketStart;
+	delete []bucketCodes;
+	delete []bucketIndex;
+	delete []blockStart;
+	delete []blockBits;
+	delete []groupBits;
+	delete []groupUpTo;
+	delete []keyShift;
+	delete []keyOffset;
+	delete []keyMask;
+	return ok;
 }
 
 void* DeNovoMotifs_findMisMatchEnrichmentThread(void* threadArgs) {
@@ -1086,67 +1695,82 @@ void* DeNovoMotifs_findMisMatchEnrichmentThread(void* threadArgs) {
 	return NULL;
 }
 
+// Threads claim SCREEN_CLAIM_BLOCK oligos per atomic add. The meter is
+// updated once per block, so its '=' count can differ from HOMER v5.1's
+// (stderr only).
+#define SCREEN_CLAIM_BLOCK 64
+
 void DeNovoMotifs::findMisMatchEnrichmentThread(ThreadArgs_findMisMatchEnrichmentThread* args) {
 
-	int i=-1;
-
-	while (i < mutexTotal) {
-
-		pthread_mutex_lock(&mutex);
-		i=mutexIndex++;
-		if (i > nextMeter) {
-			///////////////////Need to deal with "next"
-			if (i <= args->lastCheckedTotal) {
-				if (args->verboseLevel != HOMER_VERBOSE_LEVEL0) {
-					fprintf(stderr, "=");
+	const long long total = mutexTotal;
+	for (;;) {
+		long long start = screenNext.fetch_add(SCREEN_CLAIM_BLOCK, std::memory_order_relaxed);
+		if (start >= total) break;
+		int end = (int)(total - start > SCREEN_CLAIM_BLOCK ? start + SCREEN_CLAIM_BLOCK : total);
+		if (args->verboseLevel != HOMER_VERBOSE_LEVEL0) {
+			pthread_mutex_lock(&mutex);
+			for (int i=(int)start;i<end;i++) {
+				if (i > nextMeter) {
+					if (i <= args->lastCheckedTotal) {
+						fprintf(stderr, "=");
+					}
+					nextMeter += incMeter;
 				}
 			}
-			//fprintf(stderr, "=%d %d",i,next);
-			nextMeter += incMeter;
+			pthread_mutex_unlock(&mutex);
 		}
-		pthread_mutex_unlock(&mutex);
-		if (i >= mutexTotal) break;
+		for (int i=(int)start;i<end;i++) {
 
-		double logp = 0.0;
-		double vt = (double)oligoArray->activeOligos[i]->numTarget;
-		double vbg = (double)oligoArray->activeOligos[i]->numBackground;
-		int skipFlag = oligoArray->activeOligos[i]->flag2;
-		if (!skipFlag && misMatchTargetOnlyFlag) {
-			if (vt < 0.01) {
-				skipFlag = 1;
-				oligoArray->activeOligos[i]->flag2 = 1;
-				args->dueToTargetTags++;
+			double logp = 0.0;
+			double vt = (double)screenOligos[i]->numTarget;
+			double vbg = (double)screenOligos[i]->numBackground;
+			int skipFlag = screenOligos[i]->flag2;
+			if (!skipFlag && misMatchTargetOnlyFlag) {
+				if (vt < 0.01) {
+					skipFlag = 1;
+					screenOligos[i]->flag2 = 1;
+					args->dueToTargetTags++;
+				}
 			}
-		}
-		if (!skipFlag) {
-			if (args->maxMisMatches == 0) {
-			} else {
-				vt = 0.0;
-				vbg = 0.0;
-				oligoArray->searchOligo(oligoArray->activeOligos[i]->seq,
-									args->maxMisMatches,vt,vbg,OLIGO_SEARCH_KEEP,args->cpu);
-			}
+			if (!skipFlag) {
+				// above: vt+vbg > minimumCountsToStartSkipping for the sums HOMER v5.1 adds up.
+				int above = 0;
+				if (args->maxMisMatches == 0) {
+					above = (vt+vbg > minimumCountsToStartSkipping);
+				} else if (oligoArray->ballCells != NULL
+							&& oligoArray->ballSums(screenOligos[i]->seq, args->maxMisMatches,
+										minimumCountsToStartSkipping, vt, vbg, above)) {
+				} else if (rescreenSumsFlag
+							&& storedSums(screenOligos[i], args->maxMisMatches, vt, vbg, above)) {
+				} else {
+					vt = 0.0;
+					vbg = 0.0;
+					oligoArray->sumMisMatchCounts(screenOligos[i]->seq,
+										args->maxMisMatches,vt,vbg,args->cpu);
+					above = (vt+vbg > minimumCountsToStartSkipping);
+					if (rescreenSumsFlag) storeSums(screenOligos[i], args->maxMisMatches, vt, vbg);
+				}
 	
-			logp = scorer->scoreEnrichment(vt,vbg);
-			if (oligoArray->activeOligos[i]->value > logp) {
-				oligoArray->activeOligos[i]->value = logp;
-			} else {
-				if (minimumMisMatchToStartSkipping <= args->maxMisMatches 
-							&& (vt+vbg > minimumCountsToStartSkipping)) {
-					oligoArray->activeOligos[i]->flag2 = 1;
-					args->dueToLessThanLast++;
+				logp = scorer->scoreEnrichment(vt,vbg);
+				if (screenOligos[i]->value > logp) {
+					screenOligos[i]->value = logp;
+				} else {
+					if (minimumMisMatchToStartSkipping <= args->maxMisMatches && above) {
+						screenOligos[i]->flag2 = 1;
+						args->dueToLessThanLast++;
+					}
 				}
+				if ((minimumMisMatchToStartSkipping <= args->maxMisMatches)
+							&& (screenOligos[i]->value > misMatchMinPvalue)
+							&& above) {
+					screenOligos[i]->flag2 = 1;
+					args->dueToLowPvalue++;
+				}
+				args->totalChecked++;
+				args->lastChecked = i+1;
+			} else {
+				args->numSkipped++;
 			}
-			if ((minimumMisMatchToStartSkipping <= args->maxMisMatches)
-						&& (oligoArray->activeOligos[i]->value > misMatchMinPvalue)
-						&& (vt+vbg > minimumCountsToStartSkipping)) {
-				oligoArray->activeOligos[i]->flag2 = 1;
-				args->dueToLowPvalue++;
-			}
-			args->totalChecked++;
-			args->lastChecked = i+1;
-		} else {
-			args->numSkipped++;
 		}
 	}
 }
@@ -1175,7 +1799,7 @@ void DeNovoMotifs::initializeEnrichmentScoring() {
 void DeNovoMotifs::optimizeMotifMatrix(Motif* &motif) {
 
 	int cpu = 0;
-	optimizeMotifThreshold(motif,cpu);
+	optimizeMotifThreshold(motif,cpu,0,motifOptimizationMethod == MOTIF_OPTIMZATION_DIFFERENT_THRESHOLDS);
 	if (motif->badFlag) return;
 
 	if (motifOptimizationMethod == MOTIF_OPTIMZATION_DIFFERENT_THRESHOLDS) {
@@ -1315,24 +1939,82 @@ void DeNovoMotifs::optimizeMotifThresholdThread(ThreadArgs_optimizeMotifThreshol
 		if (i >= mutexTotal) break;
 
 		args->motifs[i]->normalize();
-		optimizeMotifThreshold(args->motifs[i],args->cpu);
+		optimizeMotifThreshold(args->motifs[i],args->cpu,1);
 	}
 }
 
-void DeNovoMotifs::optimizeMotifThreshold(Motif* motif, int cpu) {
+// The keys and oligos optimizeMotifThreshold walks: the sorted utility oligos with their
+// cpuData[cpu] keys, or a sorted KeyedOligo array.
+struct UtilityKeys {
+	Oligo** oligos;
+	int cpu;
+	double key(int i) const { return oligos[i]->cpuData[cpu]; }
+	Oligo* oligo(int i) const { return oligos[i]; }
+};
+struct KeyedOligoKeys {
+	KeyedOligo* hits;
+	double key(int i) const { return hits[i].key; }
+	Oligo* oligo(int i) const { return hits[i].oligo; }
+};
+// OligoArray::scoreOligosAtCutTagged's list: bit 0 of each oligo pointer is the strand.
+static inline Oligo* untagOligo(Oligo* o) { return (Oligo*)((uintptr_t)o & ~(uintptr_t)1); }
+struct TaggedOligoKeys {
+	KeyedOligo* hits;
+	double key(int i) const { return hits[i].key; }
+	Oligo* oligo(int i) const { return untagOligo(hits[i].oligo); }
+};
+// Walks the sorted hits from the top, scoring each group of tied keys, until a break test fires.
+// Returns the index at which it broke, or -1 when it read every entry.
+template <class Keys>
+static int walkMotifThreshold(const Keys& keys, int numHits, double minimumScore, double numTargets,
+				double maxBackground, EnrichmentScorer* scorer, double &bestThreshold, double &bestScore,
+				double &bestTvalue, double &bestBGvalue) {
+	double currentTvalue = 0;
+	double currentBGvalue = 0;
+	double currentThreshold = 0;
+	for (int i=0;i<numHits;i++) {
+		currentTvalue += keys.oligo(i)->numTarget;
+		currentBGvalue += keys.oligo(i)->numBackground;
+		currentThreshold = keys.key(i);
+		if (i+1<numHits) {
+			// need to keep going if a bunch of oligos have the same threshold
+			double diff = currentThreshold - keys.key(i+1);
+			if (diff < FLOAT_EPS) {
+				continue;
+			}
+		}
+		double logp = scorer->scoreEnrichment(currentTvalue,currentBGvalue);
+		if (logp < bestScore) {
+			bestScore = logp;
+			bestThreshold = currentThreshold;
+			bestTvalue = currentTvalue;
+			bestBGvalue = currentBGvalue;
+		}
+		if (currentThreshold < minimumScore) return i;
+		if (logp > bestScore/3.0 && currentTvalue > numTargets) return i;
+		if (currentBGvalue > maxBackground) return i;
+	}
+	return -1;
+}
+
+// loopFollows: the base call of optimizeMotifMatrix, whose loop reads the list it leaves.
+void DeNovoMotifs::optimizeMotifThreshold(Motif* motif, int cpu, int trial, int loopFollows) {
 
 	motif->setMinimumScore(maximumExpectedPerBp);
-	oligoArray->scoreOligosWithMotif(motif,motif->minimumScore,MOTIF_SCORE_OLIGOS,cpu);
-	oligoArray->sortUtilityOligos(cpu);
+	if (trial && trialCuts != NULL && optimizeMotifThresholdAtCut(motif,cpu)) return;
+	if (!trial && loopFollows && cpu == 0 && trialCuts != NULL && optimizeBaseThresholdAtCut(motif)) return;
+	if (trial) {
+		oligoArray->scoreOligosWithMotif(motif,motif->minimumScore,MOTIF_SCORE_OLIGOS,cpu);
+		oligoArray->sortUtilityOligos(cpu);
+	} else {
+		// the base call: the trial threads it feeds have not started
+		oligoArray->scoreSortUtilityOligos(motif,motif->minimumScore,cpu);
+	}
 
 	double bestThreshold = 0;
 	double bestScore = 0;
 	double bestTvalue = 0;
 	double bestBGvalue = 0;
-	double currentTvalue = 0;
-	double currentBGvalue = 0;
-	double currentThreshold = 0;
-	double maxBackground = maxBackgroundPercent*numBackground;
 	Oligo** utilityOligos = oligoArray->utilityOligos[cpu];
 	int numUtilityOligos = oligoArray->numUtilityOligos[cpu];
 	if (numUtilityOligos < 1) {
@@ -1340,46 +2022,25 @@ void DeNovoMotifs::optimizeMotifThreshold(Motif* motif, int cpu) {
 		motif->badFlag = 1;
 		return;
 	}
-	//int bestIndex = 0;
-	//int lastChecked = 0;
-	double bestPossibleThreshold = utilityOligos[0]->cpuData[cpu];
-	double lowestPossibleThreshold = utilityOligos[numUtilityOligos-1]->cpuData[cpu];
-	//fprintf(stderr, "\t%lf\t%lf\t%lf\n", motif->minimumScore, bestPossibleThreshold, lowestPossibleThreshold);
-	for (int i=0;i<numUtilityOligos;i++) {
-		currentTvalue += utilityOligos[i]->numTarget;
-		currentBGvalue += utilityOligos[i]->numBackground;
-		currentThreshold = utilityOligos[i]->cpuData[cpu];
-		if (i+1<numUtilityOligos) {
-			// need to keep going if a bunch of oligos have the same threshold
-			double diff = currentThreshold - utilityOligos[i+1]->cpuData[cpu];
-			if (diff < FLOAT_EPS) {
-				continue;
-			}
-			//fprintf(stderr, "diff=%le\n", diff);
-		}
-		double logp = scorer->scoreEnrichment(currentTvalue,currentBGvalue);
-		//fprintf(stderr, "%lf\t%lf\t%lf\t%lf\n", currentThreshold, logp,currentTvalue,numTargets);
-		if (logp < bestScore) {
-			//bestIndex = i;
-			bestScore = logp;
-			bestThreshold = currentThreshold;
-			bestTvalue = currentTvalue;
-			bestBGvalue = currentBGvalue;
-		}
-		if (currentThreshold < motif->minimumScore) break;
-		if (logp > bestScore/3.0 && currentTvalue > numTargets) break;
-		if (currentBGvalue > maxBackground) break;
-		//lastChecked = i;
-		/*fprintf(stderr, "%s\t%lf\t%lf\t%lf\t%lf\t%lf\n", utilityOligos[i]->seq, 
-					currentTvalue, currentBGvalue, currentThreshold, logp, bestScore);*/
+	UtilityKeys keys = {utilityOligos,cpu};
+	double bestPossibleThreshold = keys.key(0);
+	double lowestPossibleThreshold = keys.key(numUtilityOligos-1);
+	int breakIndex = walkMotifThreshold(keys,numUtilityOligos,motif->minimumScore,numTargets,
+				maxBackgroundPercent*numBackground,scorer,bestThreshold,bestScore,bestTvalue,bestBGvalue);
+	if (trial && trialCuts != NULL) {
+		double nextKey = (breakIndex >= 0 && breakIndex+1 < numUtilityOligos) ? keys.key(breakIndex+1) : 0.0;
+		setTrialCut(motif,cpu,breakIndex,numUtilityOligos,bestPossibleThreshold,nextKey,bestThreshold);
 	}
-	//fprintf(stderr, "%d of %d of %d\n", bestIndex, lastChecked,numUtilityOligos);
 	double degfrac = (bestPossibleThreshold-bestThreshold)
 							/(bestPossibleThreshold-lowestPossibleThreshold+0.01);
 	if (degfrac > 0.9) {
 		fprintf(stderr, "Optimal threshold is low - motif appears very degenerate!!!\n");
 	}
-	
+	setMotifThreshold(motif,bestThreshold,bestScore,bestTvalue,bestBGvalue);
+}
+
+void DeNovoMotifs::setMotifThreshold(Motif* motif, double bestThreshold, double bestScore,
+				double bestTvalue, double bestBGvalue) {
 	motif->threshold = bestThreshold-0.000001;
 	motif->logp = bestScore;
 	motif->numTarget = bestTvalue;
@@ -1390,7 +2051,193 @@ void DeNovoMotifs::optimizeMotifThreshold(Motif* motif, int cpu) {
 		motif->freqTarget = scorer->getZoopsApproxTarget(bestTvalue)/numTargets;
 		motif->freqBackground = scorer->getZoopsApproxBackground(bestBGvalue)/numBackground;
 	}
-//	fprintf(stderr, "\t%.3lf\t%.3lf\n", motif->minimumScore, motif->threshold);
+}
+
+// A trial thread's optimizeMotifThreshold keeps only the oligos scoring at or above a cut above
+// minimumScore. They are the oligos, scores and trie order that minimumScore's hits have at or
+// above the cut, and the full sort puts them first, so a walk that breaks before the last kept
+// entry (each entry is compared with the next) reads what the full walk reads. The degenerate-motif
+// warning reads the lowest hit's key; the full list's lowest key is no higher, so its degfrac is no
+// larger, and the cut is used only when its own degfrac is <= 0.9. Oligo::value and flag and
+// cpuData[cpu] are not written: the next readers of value and flag follow initializeOligoPvalues
+// and a cpu-0 scoreOligosWithMotif, and cpuData[cpu] is read only after this CPU scores again.
+// One retry at a lower cut, then 0 (the full scoring runs).
+int DeNovoMotifs::optimizeMotifThresholdAtCut(Motif* motif, int cpu) {
+	TrialCut& tc = trialCuts[cpu];
+	double frac = tc.frac;
+	if (!(frac > 0.0)) return 0;
+	double sumMax = 0.0;
+	for (int i=0;i<motif->length;i++) {
+		double mx = 0.0;
+		for (int j=0;j<alphaSize;j++) {
+			double v = motif->m[i][j];
+			if (!std::isfinite(v)) return 0;
+			if (fabs(v) > mx) mx = fabs(v);
+		}
+		sumMax += mx;
+	}
+	// The trie's pruning bounds sum in another order than the leaf scores; the margin covers the rounding.
+	double margin = 1e-9*(1.0+sumMax);
+	double minimumScore = motif->minimumScore;
+	double range = motif->fwdMaxPossible[0]-minimumScore;
+	double maxBackground = maxBackgroundPercent*numBackground;
+	for (int attempt=0;attempt<2;attempt++,frac*=TRIAL_CUT_ESCALATE) {
+		double cut = minimumScore+frac*range;
+		double pruneAt = cut-margin;
+		if (!std::isfinite(cut) || !(pruneAt >= minimumScore)) return 0;
+		int numHits = oligoArray->scoreOligosAtCut(motif,pruneAt,cut,cpu,tc.hits,tc.maxHits);
+		if (numHits < 2) continue;
+		// Stable, so tied oligos keep trie order, as sortUtilityOligos leaves them.
+		std::stable_sort(tc.hits, tc.hits+numHits, [](const KeyedOligo& a, const KeyedOligo& b) {
+			return a.key > b.key;
+		});
+		KeyedOligoKeys keys = {tc.hits};
+		double bestThreshold = 0;
+		double bestScore = 0;
+		double bestTvalue = 0;
+		double bestBGvalue = 0;
+		int breakIndex = walkMotifThreshold(keys,numHits,minimumScore,numTargets,maxBackground,scorer,
+								bestThreshold,bestScore,bestTvalue,bestBGvalue);
+		if (breakIndex < 0 || breakIndex >= numHits-1) continue;
+		double bestPossibleThreshold = keys.key(0);
+		double lowestKeptThreshold = keys.key(numHits-1);
+		double degfrac = (bestPossibleThreshold-bestThreshold)
+								/(bestPossibleThreshold-lowestKeptThreshold+0.01);
+		if (degfrac > 0.9) continue;
+		setTrialCut(motif,cpu,breakIndex,numHits,bestPossibleThreshold,keys.key(breakIndex+1),bestThreshold);
+		setMotifThreshold(motif,bestThreshold,bestScore,bestTvalue,bestBGvalue);
+		return 1;
+	}
+	return 0;
+}
+
+// Sets this CPU's next cut from a finished walk: the cut that would just have kept the entry
+// after the break and kept degfrac <= 0.9, as a fraction of the range, lowered by TRIAL_CUT_SLACK.
+void DeNovoMotifs::setTrialCut(Motif* motif, int cpu, int breakIndex, int numHits, double bestKey,
+				double nextKey, double bestThreshold) {
+	TrialCut& tc = trialCuts[cpu];
+	tc.frac = 0.0;
+	if (breakIndex < 0 || breakIndex+1 >= numHits) return;
+	double range = motif->fwdMaxPossible[0]-motif->minimumScore;
+	if (!(range > 0.0)) return;
+	double need = nextKey;
+	double degNeed = bestKey+0.01-(bestKey-bestThreshold)/0.9;
+	if (degNeed < need) need = degNeed;
+	double f = (need-motif->minimumScore)/range*(1.0-TRIAL_CUT_SLACK);
+	if (f > 0.0 && f < 1.0) tc.frac = f;
+}
+
+// optimizeMotifMatrix's base call (cpu 0) from the oligos scoring at or above a cut above
+// minimumScore, as optimizeMotifThresholdAtCut does for the trial threads: they are the head of the
+// full sorted list, so a threshold walk that breaks before the last kept entry, with kept degfrac
+// <= 0.9, sets what the full call sets and prints the same. optimizeMotifMatrix's loop then reads
+// the list from the top until it has made numTrialMotifs matrices; where it stops depends only on
+// the keys, the top key and motif->threshold, so the loop is replayed on the kept keys and the cut
+// is used only when it stops before the last kept entry. utilityOligos[0] then holds the list up to
+// the entry after that stop, with value and flag set as scoreOligosWithMotif sets them. Under full
+// masking the value and flag of the hits the loop does not read, and cpuData[0], are rewritten
+// before any read (initializeOligoPvalues after the mask, or the next cpu-0 scoring). The kept
+// list goes in trialCuts[0]'s buffer, which the trial threads take only after this call.
+// One retry at the stop the first list implies, then 0 (the full scoring runs).
+int DeNovoMotifs::optimizeBaseThresholdAtCut(Motif* motif) {
+	if (numTrialMotifs < 1) return 0;
+	double sumMax = 0.0;
+	for (int i=0;i<motif->length;i++) {
+		double mx = 0.0;
+		for (int j=0;j<alphaSize;j++) {
+			double v = motif->m[i][j];
+			if (!std::isfinite(v)) return 0;
+			if (fabs(v) > mx) mx = fabs(v);
+		}
+		sumMax += mx;
+	}
+	double margin = 1e-9*(1.0+sumMax);
+	double minimumScore = motif->minimumScore;
+	double range = motif->fwdMaxPossible[0]-minimumScore;
+	if (!std::isfinite(range) || !(range > 0.0)) return 0;
+	int halfTrialMotifs = (int)((numTrialMotifs+1)/2.0);
+	if (halfTrialMotifs < 1) halfTrialMotifs=1;
+	// The loop's last matrix needs a key below top - numTrialMotifs*inc, and inc >= top/(2*half),
+	// so for top > 0 it stops below about top*(1 - numTrialMotifs/(2*half)) (0 when -T is even).
+	double reach = 0.0;
+	double topBound = motif->fwdMaxPossible[0];
+	if (topBound > 0.0 && numTrialMotifs < 2*halfTrialMotifs) {
+		reach = topBound*(1.0-(double)numTrialMotifs/(2.0*halfTrialMotifs));
+	}
+	double lowest = minimumScore+2.0*margin;
+	if (!(lowest < reach)) return 0;
+	double cut = reach-BASE_CUT_SLACK*range;
+	if (cut < lowest) cut = lowest;
+	double maxBackground = maxBackgroundPercent*numBackground;
+	TrialCut& tc = trialCuts[0];
+	for (int attempt=0;attempt<2;attempt++) {
+		double pruneAt = cut-margin;
+		if (!std::isfinite(cut) || !(pruneAt >= minimumScore)) return 0;
+		int numHits = oligoArray->scoreOligosAtCutTagged(motif,pruneAt,cut,tc.hits,tc.maxHits);
+		if (numHits < 2) return 0;
+		std::stable_sort(tc.hits, tc.hits+numHits, [](const KeyedOligo& a, const KeyedOligo& b) {
+			return a.key > b.key;
+		});
+		TaggedOligoKeys keys = {tc.hits};
+		double bestThreshold = 0;
+		double bestScore = 0;
+		double bestTvalue = 0;
+		double bestBGvalue = 0;
+		int breakIndex = walkMotifThreshold(keys,numHits,minimumScore,numTargets,maxBackground,scorer,
+								bestThreshold,bestScore,bestTvalue,bestBGvalue);
+		if (breakIndex < 0 || breakIndex >= numHits-1) return 0;
+		double bestPossibleThreshold = keys.key(0);
+		double degfrac = (bestPossibleThreshold-bestThreshold)
+								/(bestPossibleThreshold-keys.key(numHits-1)+0.01);
+		if (degfrac > 0.9) return 0;
+
+		// optimizeMotifMatrix's loop on the keys, with motif->threshold as setMotifThreshold sets it
+		double top = keys.key(0);
+		double threshold = bestThreshold-0.000001;
+		double inc = (top - threshold)/(halfTrialMotifs);
+		if (inc < (top)/((double)2*halfTrialMotifs)) {
+			inc = (top)/((double)2*halfTrialMotifs);
+		}
+		double nextThreshold = top - inc;
+		int newMotifIndex = 0;
+		int stop = -1;
+		for (int i=0;i+1<numHits;i++) {
+			double currentThreshold = keys.key(i);
+			double diff = currentThreshold - keys.key(i+1);
+			if (diff < FLOAT_EPS) continue;
+			if (currentThreshold < nextThreshold) {
+				newMotifIndex++;
+				nextThreshold -= inc;
+				if (newMotifIndex >= numTrialMotifs) {
+					stop = i;
+					break;
+				}
+			}
+		}
+		if (stop < 0) {
+			// the loop reads past the kept list: once more at the threshold it must pass
+			double last = top - inc;
+			for (int k=1;k<numTrialMotifs;k++) last -= inc;
+			double lower = last-BASE_CUT_SLACK*range;
+			if (lower < lowest) lower = lowest;
+			if (attempt == 0 && lower < cut) {
+				cut = lower;
+				continue;
+			}
+			return 0;
+		}
+		setMotifThreshold(motif,bestThreshold,bestScore,bestTvalue,bestBGvalue);
+		Oligo** utilityOligos = oligoArray->utilityOligos[0];
+		for (int i=0;i<=stop+1;i++) {
+			Oligo* o = keys.oligo(i);
+			o->value = keys.key(i);
+			o->flag = (char)((uintptr_t)tc.hits[i].oligo & 1);
+			utilityOligos[i] = o;
+		}
+		oligoArray->numUtilityOligos[0] = stop+2;
+		return 1;
+	}
+	return 0;
 }
 
 void DeNovoMotifs::optimizeGivenMotifs() {
@@ -1460,6 +2307,10 @@ void DeNovoMotifs::optimizeSeeds2Motifs() {
 	if (oligoArray->numActiveOligos > MOTIF_MAX_SEED_OLIGOS_TOTAL) {
 		oligoArray->numActiveOligos = (int)(MOTIF_MAX_SEED_OLIGOS_TOTAL);
 	}
+	if (maskMethod == DENOVO_MASK_FULL) {
+		setupStoredSums();
+		saveScreenResults();
+	}
 	if (minimumSeedLogp > MOTIF_SEED_MINIMUM_LOGP-0.01 
 			&& minimumSeedLogp < MOTIF_SEED_MINIMUM_LOGP+0.01) {
 		//default value - adjust for the target genes, the less of which lowers pvalues
@@ -1474,6 +2325,16 @@ void DeNovoMotifs::optimizeSeeds2Motifs() {
 	OligoArray* boundOligos = new OligoArray();
 	boundOligos->init(oligoLength,numOligoEstimate/4,alphaSize,strand,1);
 	int defaultCPU = 0;
+	// Under -quickMask the next seed's logp is read from the trial threads' Oligo::value, so
+	// every trial scores all of minimumScore's hits there.
+	if (maskMethod == DENOVO_MASK_FULL) {
+		trialCuts = new TrialCut[numCPUs];
+		for (unsigned int j=0;j<numCPUs;j++) {
+			trialCuts[j].frac = 0.0;
+			trialCuts[j].hits = NULL;
+			trialCuts[j].maxHits = 0;
+		}
+	}
 
 	FILE* tmpfp = NULL;
 	if (tmpFile == NULL) {
@@ -1573,7 +2434,9 @@ void DeNovoMotifs::optimizeSeeds2Motifs() {
 		if (maskMethod == DENOVO_MASK_FULL) {
 			//remove sequences adjacent to motif from the original sequence that overlap
 			fprintf(stderr, "\t\tPerforming exhaustive masking of motif...\n");
+			oligoArray->trackChanges = 1;
 			fullSequences->maskMotifFromOligoArray(motifs[i],oligoArray,strand);
+			oligoArray->trackChanges = 0;
 
 			//resort active Oligos to 
 			fprintf(stderr, "\t\tReprioritizing potential motifs...\n");
@@ -1586,7 +2449,7 @@ void DeNovoMotifs::optimizeSeeds2Motifs() {
 				}
 			}
 			oligoArray->initializeOligoPvalues(scorer);
-			findMisMatchEnrichment(maxMisMatches,NULL,HOMER_VERBOSE_LEVEL0);	
+			rescreenAfterMask(maxMisMatches);
 			seedOligoIndex=0;
 
 		} else {
@@ -1610,6 +2473,13 @@ void DeNovoMotifs::optimizeSeeds2Motifs() {
 
 	}
 	if (tmpfp != NULL) fclose(tmpfp);
+	if (trialCuts != NULL) {
+		for (unsigned int j=0;j<numCPUs;j++) {
+			if (trialCuts[j].hits != NULL) delete [](trialCuts[j].hits);
+		}
+		delete []trialCuts;
+	}
+	trialCuts = NULL;
 
 	delete []bufferSeq;
 	delete boundOligos;
@@ -1662,8 +2532,6 @@ OligoArray::OligoArray() {
 	rvMap = NULL;
 	numCPUs = 1;
 
-	pthread_mutex_init(&sortMutex, NULL);
-	
 	staticOligos = NULL;
 	utilityOligos = NULL;
 	numUtilityOligos = 0;
@@ -1679,11 +2547,41 @@ OligoArray::OligoArray() {
 	positionStack = NULL;
 	fwdMisMatchStack = NULL;
 	rvMisMatchStack = NULL;
+	fwdScoreStack = NULL;
+	rvScoreStack = NULL;
+	stackBlock = NULL;
 
 	totalTarget = 0.0;	
 	totalBackground = 0.0;	
 	
 	maxAutoNormIters = MAX_OLIGO_NORMALIZATION_ITERATIONS;
+
+	trackChanges = 0;
+	changedOligos = NULL;
+	numChangedOligos = 0;
+	maxChangedOligos = 0;
+	snapContributions = 0;
+	changedSnap = NULL;
+	countsUsable = 0;
+	countsExactT = 0;
+	countsExactBg = 0;
+	countsTotalT = 0.0;
+	countsTotalBg = 0.0;
+
+	records = NULL;
+	recordBlock = NULL;
+	remainMask = NULL;
+	firstHit = NULL;
+
+	codeTable = NULL;
+	codePresent = NULL;
+	codeTableState = 0;
+	codeScratchBlock = NULL;
+	codeScratch = NULL;
+	codeScratchSize = 0;
+	codeScratchCPUs = 0;
+	ballCells = NULL;
+	ballLevels = 0;
 }
 
 OligoArray::~OligoArray() {
@@ -1700,20 +2598,12 @@ OligoArray::~OligoArray() {
 	if (alphaIndex != NULL) delete []alphaIndex;
 	if (rvAlphaIndex != NULL) delete []rvAlphaIndex;
 
-	pthread_mutex_destroy(&sortMutex);
-
 	if (numUtilityOligos != NULL) delete []numUtilityOligos;
 
 	for (int i=0;i<numCPUs;i++) {	
 		if (utilityOligos != NULL && utilityOligos[i] != NULL) delete [](utilityOligos[i]);
-		if (indexStack != NULL && indexStack[i] != NULL) delete [](indexStack[i]);
-		if (alphaStack != NULL && alphaStack[i] != NULL) delete [](alphaStack[i]);
-		if (positionStack != NULL && positionStack[i] != NULL) delete [](positionStack[i]);
-		if (fwdMisMatchStack != NULL && fwdMisMatchStack[i] != NULL) delete [](fwdMisMatchStack[i]);
-		if (rvMisMatchStack != NULL && rvMisMatchStack[i] != NULL) delete [](rvMisMatchStack[i]);
-		if (fwdScoreStack != NULL && fwdScoreStack[i] != NULL) delete [](fwdScoreStack[i]);
-		if (rvScoreStack != NULL && rvScoreStack[i] != NULL) delete [](rvScoreStack[i]);
 	}
+	if (stackBlock != NULL) delete []stackBlock;
 	if (utilityOligos != NULL) delete []utilityOligos;
 	if (indexStack != NULL) delete []indexStack;
 	if (alphaStack != NULL) delete []alphaStack;
@@ -1722,10 +2612,18 @@ OligoArray::~OligoArray() {
 	if (rvMisMatchStack != NULL) delete []rvMisMatchStack;
 	if (fwdScoreStack != NULL) delete []fwdScoreStack;
 	if (rvScoreStack != NULL) delete []rvScoreStack;
+	if (changedOligos != NULL) delete []changedOligos;
+	if (changedSnap != NULL) delete []changedSnap;
+	dropRecords();
+	if (firstHit != NULL) delete []firstHit;
+	if (codeScratchBlock != NULL) delete []codeScratchBlock;
+	if (codeScratch != NULL) delete []codeScratch;
+	dropBallSums();
 }
 
 void OligoArray::init(int length, int totalDataSetBp, int alphaSIZE, int strandFlag, int numcpu) {
 
+	dropRecords();
 	alphaSize = alphaSIZE;
 	oligoLength = length;
 	if (alphaSize == DNA_ALPHA) {
@@ -1802,6 +2700,7 @@ void OligoArray::init(int length, int totalDataSetBp, int alphaSIZE, int strandF
 	rvMisMatchStack = new int*[numCPUs];
 	fwdScoreStack = new double*[numCPUs];
 	rvScoreStack = new double*[numCPUs];
+	firstHit = new int*[numCPUs];
 	for (int i=0;i<numCPUs;i++) {
 		if (i==0) {
 			utilityOligos[i] = new Oligo*[maxOligos];
@@ -1811,13 +2710,33 @@ void OligoArray::init(int length, int totalDataSetBp, int alphaSIZE, int strandF
 		}
 
 		numUtilityOligos[i]=0;
-		indexStack[i] = new int[oligoLength];
-		alphaStack[i] = new int[oligoLength];
-		positionStack[i] = new int[oligoLength];
-		fwdMisMatchStack[i] = new int[oligoLength];
-		rvMisMatchStack[i] = new int[oligoLength];
-		fwdScoreStack[i] = new double[oligoLength];
-		rvScoreStack[i] = new double[oligoLength];
+	}
+
+	// Each CPU's stacks start on a 64-byte boundary and fill whole lines, so
+	// threads walking the tree never write to a cache line another one uses.
+	size_t cpuStackBytes = (size_t)oligoLength*(2*sizeof(double)+5*sizeof(int))+sizeof(int);
+	cpuStackBytes = ((cpuStackBytes+63)/64)*64;
+	if (cpuStackBytes == 0) cpuStackBytes = 64;
+	stackBlock = new char[cpuStackBytes*numCPUs+64];
+	char* stackBase = stackBlock + ((64-((uintptr_t)stackBlock & 63)) & 63);
+	for (int i=0;i<numCPUs;i++) {
+		char* p = stackBase + cpuStackBytes*i;
+		fwdScoreStack[i] = (double*)p;
+		p += oligoLength*sizeof(double);
+		rvScoreStack[i] = (double*)p;
+		p += oligoLength*sizeof(double);
+		indexStack[i] = (int*)p;
+		p += oligoLength*sizeof(int);
+		alphaStack[i] = (int*)p;
+		p += oligoLength*sizeof(int);
+		positionStack[i] = (int*)p;
+		p += oligoLength*sizeof(int);
+		fwdMisMatchStack[i] = (int*)p;
+		p += oligoLength*sizeof(int);
+		rvMisMatchStack[i] = (int*)p;
+		p += oligoLength*sizeof(int);
+		firstHit[i] = (int*)p;
+		firstHit[i][0] = 0;
 	}
 
 	//fprintf(stderr, "\tEstimate of prefix tree depth = %d\n", fullTreeEstimate);
@@ -1862,6 +2781,654 @@ void OligoArray::optimizeMemoryUsage() {
 		}
 	}
 	delete []tmpOligos;
+	buildRecords();
+}
+
+static inline int dnaBaseCode(char c) {
+	switch (c) {
+		case 'A': return 0;
+		case 'C': return 1;
+		case 'G': return 2;
+		case 'T': return 3;
+	}
+	return -1;
+}
+
+// Number of set bits in m, which has set bits only at even positions.
+static inline int countMarkedFields(uint64_t m) {
+	m = (m & 0x3333333333333333ULL) + ((m >> 2) & 0x3333333333333333ULL);
+	m = (m + (m >> 4)) & 0x0f0f0f0f0f0f0f0fULL;
+	return (int)((m * 0x0101010101010101ULL) >> 56);
+}
+
+void OligoArray::buildRecords() {
+	dropRecords();
+	if (alphaSize != DNA_ALPHA || oligoLength < 1 || oligoLength > 32) return;
+	recordBlock = new char[(size_t)(numOligos+1)*sizeof(OligoRecord)+64];
+	OligoRecord* recs = (OligoRecord*)(recordBlock + ((64-((uintptr_t)recordBlock & 63)) & 63));
+	recs[0].code = 0;
+	recs[0].numTarget = 0.0;
+	recs[0].numBackground = 0.0;
+	recs[0].oligo = NULL;
+	for (int i=1;i<=numOligos;i++) {
+		Oligo* o = staticOligos[i];
+		uint64_t code = 0;
+		for (int j=0;j<oligoLength;j++) {
+			int c = dnaBaseCode(o->seq[j]);
+			if (c < 0) {
+				delete []recordBlock;
+				recordBlock = NULL;
+				return;
+			}
+			code |= (uint64_t)c << (2*j);
+		}
+		recs[i].code = code;
+		recs[i].numTarget = o->numTarget;
+		recs[i].numBackground = o->numBackground;
+		recs[i].oligo = o;
+	}
+	remainMask = new uint64_t[oligoLength];
+	uint64_t all = (oligoLength == 32) ? ~0ULL : ((1ULL << (2*oligoLength))-1);
+	for (int d=0;d<oligoLength;d++) {
+		uint64_t upTo = (d+1 == 32) ? ~0ULL : ((1ULL << (2*(d+1)))-1);
+		remainMask[d] = 0x5555555555555555ULL & all & ~upTo;
+	}
+	records = recs;
+}
+
+void OligoArray::dropRecords() {
+	dropCodeTable();
+	if (recordBlock != NULL) delete []recordBlock;
+	if (remainMask != NULL) delete []remainMask;
+	recordBlock = NULL;
+	remainMask = NULL;
+	records = NULL;
+}
+
+#define MAX_CODE_TABLE_LENGTH 12
+#define MAX_CODE_NEIGHBOURS 65536
+
+// Lexicographic code of a record's oligo: base 0 in the top bits, so codes
+// sort as the tree's leaves do (children A, C, G, T).
+static inline uint32_t lexCodeOfRecord(uint64_t code, int len) {
+	uint32_t k = 0;
+	for (int i=0;i<len;i++) k = (k << 2) | (uint32_t)((code >> (2*i)) & 3);
+	return k;
+}
+
+// Number of sequences of length len within m mismatches of one, or cap+1
+// when that is larger than cap.
+static int neighbourCount(int len, int m, int cap) {
+	long long total = 0, choose = 1, pow3 = 1;
+	for (int k=0;k<=m && k<=len;k++) {
+		if (k > 0) {
+			choose = choose*(len-k+1)/k;
+			pow3 *= 3;
+		}
+		total += choose*pow3;
+		if (total > cap) return cap+1;
+	}
+	return (int)total;
+}
+
+// Appends every code within budget mismatches of q, in increasing order.
+static void appendNeighbourCodes(uint32_t q, int len, int pos, uint32_t prefix, int budget, uint32_t*& out) {
+	if (budget == 0 || pos == len) {
+		int rest = len-pos;
+		*out++ = (prefix << (2*rest)) | (q & ((1u << (2*rest))-1));
+		return;
+	}
+	int qb = (q >> (2*(len-1-pos))) & 3;
+	for (int b=0;b<4;b++) {
+		appendNeighbourCodes(q, len, pos+1, (prefix << 2) | (uint32_t)b, budget-(b != qb), out);
+	}
+}
+
+void OligoArray::dropCodeTable() {
+	if (codeTable != NULL) delete []codeTable;
+	if (codePresent != NULL) delete []codePresent;
+	codeTable = NULL;
+	codePresent = NULL;
+	codeTableState = 0;
+}
+
+// Tables every leaf reachable from the root. A leaf whose oligo does not
+// start with its path, or two leaves with one sequence, leave the table
+// unusable, and the screen searches the tree.
+void OligoArray::buildCodeTable() {
+	dropCodeTable();
+	codeTableState = -1;
+	if (records == NULL || alphaSize != DNA_ALPHA || oligoLength < 1
+				|| oligoLength > MAX_CODE_TABLE_LENGTH || numTree < alphaSize) return;
+	size_t numCodes = (size_t)1 << (2*oligoLength);
+	codeTable = new int[numCodes]();
+	codePresent = new uint64_t[(numCodes+63)/64]();
+	int stackNode[4*MAX_CODE_TABLE_LENGTH+4];
+	int stackDepth[4*MAX_CODE_TABLE_LENGTH+4];
+	uint32_t stackPath[4*MAX_CODE_TABLE_LENGTH+4];
+	int sp = 0;
+	stackNode[0] = 0;
+	stackDepth[0] = 0;
+	stackPath[0] = 0;
+	while (sp >= 0) {
+		int node = stackNode[sp];
+		int depth = stackDepth[sp];
+		uint32_t path = stackPath[sp];
+		sp--;
+		for (int b=0;b<alphaSize;b++) {
+			int v = tree[node+b];
+			uint32_t childPath = (path << 2) | (uint32_t)b;
+			if (v < 0) {
+				uint32_t key = lexCodeOfRecord(records[-v].code, oligoLength);
+				if ((key >> (2*(oligoLength-1-depth))) != childPath || codeTable[key] != 0) {
+					dropCodeTable();
+					codeTableState = -1;
+					return;
+				}
+				codeTable[key] = -v;
+				codePresent[key >> 6] |= 1ULL << (key & 63);
+			} else if (v > 0) {
+				if (depth+1 >= oligoLength) {
+					dropCodeTable();
+					codeTableState = -1;
+					return;
+				}
+				sp++;
+				stackNode[sp] = v;
+				stackDepth[sp] = depth+1;
+				stackPath[sp] = childPath;
+			}
+		}
+	}
+	codeTableState = 1;
+}
+
+// Builds the table on first use and sizes every CPU's scratch for queries
+// with up to maxMisMatches mismatches. Returns 1 when sumMisMatchCounts will
+// use the table for them. Not thread-safe: call before the screen's threads.
+int OligoArray::prepareCodeTable(int maxMisMatches) {
+	if (maxMisMatches < 1) return 0;
+	if (codeTableState == 0) buildCodeTable();
+	if (codeTableState != 1) return 0;
+	int need = neighbourCount(oligoLength, maxMisMatches, MAX_CODE_NEIGHBOURS);
+	if (need > MAX_CODE_NEIGHBOURS) return 0;
+	if (codeScratch == NULL || need > codeScratchSize || codeScratchCPUs != numCPUs) {
+		if (codeScratchBlock != NULL) delete []codeScratchBlock;
+		if (codeScratch != NULL) delete []codeScratch;
+		int size = ((need+15)/16)*16;
+		size_t perCPU = (size_t)6*size*sizeof(uint32_t);
+		codeScratchBlock = new char[perCPU*numCPUs+64];
+		char* base = codeScratchBlock + ((64-((uintptr_t)codeScratchBlock & 63)) & 63);
+		codeScratch = new uint32_t*[numCPUs];
+		for (int i=0;i<numCPUs;i++) codeScratch[i] = (uint32_t*)(base + perCPU*i);
+		codeScratchSize = size;
+		codeScratchCPUs = numCPUs;
+	}
+	return 1;
+}
+
+void OligoArray::unsetCode(int oligoIndex) {
+	uint32_t key = lexCodeOfRecord(records[oligoIndex].code, oligoLength);
+	if (codeTable[key] == oligoIndex) {
+		codeTable[key] = 0;
+		codePresent[key >> 6] &= ~(1ULL << (key & 63));
+	}
+}
+
+// An oligo leaving the tree: out of the table, and with trackChanges listed
+// as changed, since the searches near it no longer add its counts.
+void OligoArray::dropTreeLeaf(int oligoIndex) {
+	if (trackChanges) recordChangedOligo(staticOligos[oligoIndex]);
+	if (codeTableState == 1) unsetCode(oligoIndex);
+}
+
+void OligoArray::dropLeavesBelow(int node) {
+	for (int b=0;b<alphaSize;b++) {
+		int w = tree[node+b];
+		if (w < 0) dropTreeLeaf(-w);
+		else if (w > 0) dropLeavesBelow(w);
+	}
+}
+
+// Empties one tree slot, first dropping every oligo below it. The removal
+// searches, as in HOMER v5.1, also clear slots of live oligos (the next
+// sibling's, or slot A of the node built after the parent), so those can be
+// any oligos.
+void OligoArray::clearTreeSlot(int slot) {
+	int v = tree[slot];
+	if (v < 0) {
+		dropTreeLeaf(-v);
+	} else if (v > 0 && (codeTableState == 1 || trackChanges)) {
+		dropLeavesBelow(v);
+	}
+	tree[slot] = 0;
+}
+
+// searchOligo's KEEP sums (vt, vbg) for an A/C/G/T query, from the table:
+// the neighbours of the query and, with rvFlag, of its reverse complement,
+// merged in lexicographic order without duplicates, which is the order the
+// tree adds the hits' counts in. Unlike searchOligo it lists no hits and sets
+// no flag; the screen reads only the sums. Other queries search the tree.
+void OligoArray::sumMisMatchCounts(char* seq, int maxMisMatches, double& vt, double& vbg, int cpu) {
+	int len = oligoLength;
+	int count = -1;
+	if (codeTableState == 1 && cpu < codeScratchCPUs && maxMisMatches >= 0) {
+		count = neighbourCount(len, maxMisMatches, codeScratchSize);
+	}
+	uint32_t fwd = 0;
+	uint32_t rv = 0;
+	if (count >= 0 && count <= codeScratchSize) {
+		for (int i=0;i<len;i++) {
+			int c = dnaBaseCode(seq[i]);
+			if (c < 0) {
+				count = -1;
+				break;
+			}
+			fwd = (fwd << 2) | (uint32_t)c;
+			rv |= (uint32_t)(3-c) << (2*i);
+		}
+	}
+	if (count < 0 || count > codeScratchSize) {
+		searchOligo(seq,maxMisMatches,vt,vbg,OLIGO_SEARCH_KEEP,cpu);
+		return;
+	}
+	int size = codeScratchSize;
+	uint32_t* fwdCodes = codeScratch[cpu];
+	uint32_t* rvCodes = fwdCodes + size;
+	uint32_t* fwdHits = rvCodes + size;
+	uint32_t* rvHits = fwdHits + size;
+	uint32_t* hits = rvHits + size;
+	const uint64_t* present = codePresent;
+	const int* table = codeTable;
+
+	uint32_t* end = fwdCodes;
+	appendNeighbourCodes(fwd, len, 0, 0, maxMisMatches, end);
+	int n = (int)(end-fwdCodes);
+	int numFwd = 0;
+	for (int i=0;i<n;i++) {
+		uint32_t k = fwdCodes[i];
+		fwdHits[numFwd] = k;
+		numFwd += (int)((present[k >> 6] >> (k & 63)) & 1);
+	}
+	int numHits = numFwd;
+	if (rvFlag) {
+		end = rvCodes;
+		appendNeighbourCodes(rv, len, 0, 0, maxMisMatches, end);
+		n = (int)(end-rvCodes);
+		int numRv = 0;
+		for (int i=0;i<n;i++) {
+			uint32_t k = rvCodes[i];
+			rvHits[numRv] = k;
+			numRv += (int)((present[k >> 6] >> (k & 63)) & 1);
+		}
+		int i=0, j=0;
+		numHits = 0;
+		while (i < numFwd && j < numRv) {
+			uint32_t x = fwdHits[i];
+			uint32_t y = rvHits[j];
+			if (x < y) {
+				hits[numHits++] = x;
+				__builtin_prefetch(&table[x]);
+				i++;
+			} else if (y < x) {
+				hits[numHits++] = y;
+				__builtin_prefetch(&table[y]);
+				j++;
+			} else {
+				hits[numHits++] = x;
+				__builtin_prefetch(&table[x]);
+				i++;
+				j++;
+			}
+		}
+		while (i < numFwd) {
+			uint32_t k = fwdHits[i++];
+			hits[numHits++] = k;
+			__builtin_prefetch(&table[k]);
+		}
+		while (j < numRv) {
+			uint32_t k = rvHits[j++];
+			hits[numHits++] = k;
+			__builtin_prefetch(&table[k]);
+		}
+	} else {
+		hits = fwdHits;
+	}
+	// Two passes, so the records' loads overlap instead of each waiting on its
+	// table load; the counts are added in hit order. The oligo numbers go in
+	// the neighbour lists' 2*size codes, free by now (hits can need 2*size).
+	uint32_t* numbers = fwdCodes;
+	const OligoRecord* recs = records;
+	for (int i=0;i<numHits;i++) {
+		uint32_t number = (uint32_t)table[hits[i]];
+		numbers[i] = number;
+		__builtin_prefetch(&recs[number]);
+	}
+	for (int i=0;i<numHits;i++) {
+		const OligoRecord& r = recs[numbers[i]];
+		vt += r.numTarget;
+		vbg += r.numBackground;
+	}
+}
+
+// searchOligo KEEP at 0 mismatches from the table, for an A/C/G/T query:
+// leaves the hits in tree order (the smaller code first), their number, the
+// first hit's oligo number and flag = 1 as that search does, without the sums.
+// Returns -1 when the tree must be searched instead.
+int OligoArray::findExactOligo(char* seq, int cpu) {
+	if (codeTableState != 1) return -1;
+	int len = oligoLength;
+	uint32_t fwd = 0;
+	uint32_t rv = 0;
+	for (int i=0;i<len;i++) {
+		int c = dnaBaseCode(seq[i]);
+		if (c < 0) return -1;
+		fwd = (fwd << 2) | (uint32_t)c;
+		rv |= (uint32_t)(3-c) << (2*i);
+	}
+	uint32_t keys[2];
+	int numKeys = 1;
+	keys[0] = fwd;
+	if (rvFlag && rv != fwd) {
+		keys[0] = (fwd < rv) ? fwd : rv;
+		keys[1] = (fwd < rv) ? rv : fwd;
+		numKeys = 2;
+	}
+	Oligo** hits = utilityOligos[cpu];
+	int numHits = 0;
+	int firstHitIndex = 0;
+	for (int i=0;i<numKeys;i++) {
+		int index = codeTable[keys[i]];
+		if (index == 0) continue;
+		Oligo* o = records[index].oligo;
+		o->flag = 1;
+		if (numHits == 0) firstHitIndex = index;
+		hits[numHits++] = o;
+	}
+	numUtilityOligos[cpu] = numHits;
+	firstHit[cpu][0] = firstHitIndex;
+	return numHits;
+}
+
+
+// Mismatch-ball sums for the first screen. B_r(x) is the sum of the counts of
+// every code within r mismatches of code x. With B_r = A (the counts) for
+// every r to start, one step per base position i applies
+//   B_r(x) += sum over the 3 other bases b at i of B_{r-1}(x with b at i),
+// top level first, so that B_{r-1} still excludes position i. Every count
+// reaches an output through at most 3 additions per position, and every
+// partial sum is a sum of distinct codes' counts.
+#define BALL_MAX_LEVELS 2
+#define BALL_BASE_DIGITS 6
+// Built when the passes' neighbour codes (one per code per query) exceed
+// this many per code, position and level of the transform.
+#define BALL_BUILD_RATIO 2.0
+
+// (target, background) as one SSE2 register: the same two IEEE additions.
+typedef double BallPair __attribute__((vector_size(16)));
+static inline BallPair ballLoad(const double* p) {
+	BallPair v;
+	memcpy(&v, p, sizeof(v));
+	return v;
+}
+static inline void ballStore(double* p, BallPair v) {
+	memcpy(p, &v, sizeof(v));
+}
+
+// Applies one position to the 4 cells c0 + {0,1,2,3}*st (doubles), each cell
+// holding M+1 (target, background) pairs.
+template<int M>
+static inline void ballGroup(double* c0, size_t st) {
+	double* c1 = c0+st;
+	double* c2 = c1+st;
+	double* c3 = c2+st;
+	for (int r=M;r>=1;r--) {
+		const int o = 2*(r-1);
+		const int w = 2*r;
+		BallPair a0 = ballLoad(c0+o);
+		BallPair a1 = ballLoad(c1+o);
+		BallPair a2 = ballLoad(c2+o);
+		BallPair a3 = ballLoad(c3+o);
+		BallPair p01 = a0+a1;
+		BallPair p23 = a2+a3;
+		ballStore(c0+w, ballLoad(c0+w) + (a1+p23));
+		ballStore(c1+w, ballLoad(c1+w) + (a0+p23));
+		ballStore(c2+w, ballLoad(c2+w) + (p01+a3));
+		ballStore(c3+w, ballLoad(c3+w) + (p01+a2));
+	}
+}
+
+// Positions p and p+1 (cell strides size and 4*size) for the 16 cells
+// at base + q*size cells, q = 0..15.
+template<int M>
+static inline void ballPair(double* base, size_t size) {
+	const size_t CS = 2*(M+1);
+	for (int hi=0;hi<4;hi++) ballGroup<M>(base + 4*hi*size*CS, size*CS);
+	for (int lo=0;lo<4;lo++) ballGroup<M>(base + lo*size*CS, 4*size*CS);
+}
+
+struct BallFillStats {
+	int bad;
+	int fracT;
+	int fracBg;
+	double sumT;
+	double sumBg;
+};
+
+struct BallSource {
+	const uint64_t* present;
+	const int* table;
+	const OligoRecord* recs;
+};
+
+// Fills and transforms the block of 4^d cells for codes k0.., all positions
+// below d.
+template<int M>
+static void ballBlock(double* cells, size_t k0, int d, const BallSource& src, BallFillStats& st) {
+	const size_t CS = 2*(M+1);
+	if (d <= BALL_BASE_DIGITS) {
+		size_t n = (size_t)1 << (2*d);
+		for (size_t i=0;i<n;i++) {
+			size_t k = k0+i;
+			double t = 0.0;
+			double g = 0.0;
+			if ((src.present[k >> 6] >> (k & 63)) & 1) {
+				const OligoRecord& r = src.recs[src.table[k]];
+				t = r.numTarget;
+				g = r.numBackground;
+				if (!(t >= 0.0 && t <= DBL_MAX && g >= 0.0 && g <= DBL_MAX)) st.bad = 1;
+				if (t != floor(t)) st.fracT = 1;
+				if (g != floor(g)) st.fracBg = 1;
+				st.sumT += t;
+				st.sumBg += g;
+			}
+			double* c = cells + i*CS;
+			for (int l=0;l<=M;l++) {
+				c[2*l] = t;
+				c[2*l+1] = g;
+			}
+		}
+		for (int p=0;p<d;p++) {
+			size_t s = (size_t)1 << (2*p);
+			for (size_t g0=0;g0<n;g0+=4*s) {
+				for (size_t u=0;u<s;u++) ballGroup<M>(cells + (g0+u)*CS, s*CS);
+			}
+		}
+		return;
+	}
+	size_t size = (size_t)1 << (2*(d-2));
+	for (int q=0;q<16;q++) ballBlock<M>(cells + q*size*CS, k0 + q*size, d-2, src, st);
+	for (size_t u=0;u<size;u++) ballPair<M>(cells + u*CS, size);
+}
+
+// Runs fn(i) for i in [0, n) on up to `threads` threads.
+template <typename F>
+static void ballParallel(int n, int threads, F fn) {
+	if (threads > n) threads = n;
+	if (threads <= 1) {
+		for (int i=0;i<n;i++) fn(i);
+		return;
+	}
+	std::atomic<int> next(0);
+	std::vector<std::thread> pool;
+	for (int t=0;t<threads;t++) {
+		pool.emplace_back([&]() {
+			for (int i=next++;i<n;i=next++) fn(i);
+		});
+	}
+	for (size_t t=0;t<pool.size();t++) pool[t].join();
+}
+
+template<int M>
+static int ballTransform(double* cells, int len, const BallSource& src, int threads, BallFillStats& total) {
+	const size_t CS = 2*(M+1);
+	int taskDigits = len > BALL_BASE_DIGITS ? len-2 : len;
+	int numTasks = 1 << (2*(len-taskDigits));
+	std::vector<BallFillStats> stats(numTasks);
+	for (int t=0;t<numTasks;t++) {
+		stats[t].bad = stats[t].fracT = stats[t].fracBg = 0;
+		stats[t].sumT = stats[t].sumBg = 0.0;
+	}
+	ballParallel(numTasks, threads, [&](int t) {
+		size_t k0 = (size_t)t << (2*taskDigits);
+		ballBlock<M>(cells + k0*CS, k0, taskDigits, src, stats[t]);
+	});
+	total.bad = total.fracT = total.fracBg = 0;
+	total.sumT = total.sumBg = 0.0;
+	for (int t=0;t<numTasks;t++) {
+		total.bad |= stats[t].bad;
+		total.fracT |= stats[t].fracT;
+		total.fracBg |= stats[t].fracBg;
+		total.sumT += stats[t].sumT;
+		total.sumBg += stats[t].sumBg;
+	}
+	if (total.bad) return 0;
+	if (numTasks > 1) {
+		// positions taskDigits and taskDigits+1, the top two
+		size_t size = (size_t)1 << (2*taskDigits);
+		int chunks = threads*8;
+		ballParallel(chunks, threads, [&](int c) {
+			size_t u0 = size*(size_t)c/chunks;
+			size_t u1 = size*(size_t)(c+1)/chunks;
+			for (size_t u=u0;u<u1;u++) ballPair<M>(cells + u*CS, size);
+		});
+	}
+	return 1;
+}
+
+// Whether building the ball sums costs less than the table walks they
+// replace: numQueries oligos screened at fromMisMatches..maxMisMatches.
+int OligoArray::ballSumsWorthBuilding(int maxMisMatches, int fromMisMatches, long long numQueries) {
+	if (maxMisMatches < 1 || maxMisMatches > BALL_MAX_LEVELS || codeTableState != 1 || records == NULL
+				|| alphaSize != DNA_ALPHA || oligoLength < 1 || oligoLength > MAX_CODE_TABLE_LENGTH) return 0;
+	double walk = 0.0;
+	for (int j=fromMisMatches;j<=maxMisMatches;j++) {
+		walk += (double)neighbourCount(oligoLength, j, INT_MAX-1)*(rvFlag ? 2.0 : 1.0);
+	}
+	walk *= (double)numQueries;
+	double transform = (double)((size_t)1 << (2*oligoLength))*oligoLength*maxMisMatches;
+	return walk >= BALL_BUILD_RATIO*transform;
+}
+
+// Builds ballCells for levels 1..maxMisMatches from the code table's counts.
+// Returns 0, leaving ballCells NULL, when a count is negative or not finite,
+// or memory is short.
+int OligoArray::buildBallSums(int maxMisMatches, int numThreads) {
+	dropBallSums();
+	if (maxMisMatches < 1 || maxMisMatches > BALL_MAX_LEVELS || codeTableState != 1 || records == NULL
+				|| alphaSize != DNA_ALPHA || oligoLength < 1 || oligoLength > MAX_CODE_TABLE_LENGTH) return 0;
+	size_t numCodes = (size_t)1 << (2*oligoLength);
+	size_t CS = 2*(maxMisMatches+1);
+	double* cells = new (std::nothrow) double[numCodes*CS];
+	if (cells == NULL) return 0;
+	BallSource src;
+	src.present = codePresent;
+	src.table = codeTable;
+	src.recs = records;
+	BallFillStats total;
+	int ok = 0;
+	if (numThreads < 1) numThreads = 1;
+	if (maxMisMatches == 1) ok = ballTransform<1>(cells, oligoLength, src, numThreads, total);
+	else ok = ballTransform<2>(cells, oligoLength, src, numThreads, total);
+	if (!ok) {
+		delete []cells;
+		return 0;
+	}
+	ballCells = cells;
+	ballLevels = maxMisMatches;
+	// HOMER v5.1 adds up to nterms counts one after another, ballSums at most
+	// 3*len+1 deep; both errors are below (nterms+3*len+1)*u*sum, and
+	// DBL_EPSILON = 2u covers the rest. Integer counts with a total below
+	// 2^52 add exactly in any order.
+	const double exactLimit = 4503599627370496.0;
+	for (int j=0;j<=BALL_MAX_LEVELS;j++) {
+		double nterms = (double)neighbourCount(oligoLength, j, INT_MAX-1)*(rvFlag ? 2.0 : 1.0);
+		double k = (nterms + 3.0*oligoLength + 8.0)*DBL_EPSILON;
+		ballErrT[j] = (total.fracT || !(total.sumT < exactLimit)) ? k : 0.0;
+		ballErrBg[j] = (total.fracBg || !(total.sumBg < exactLimit)) ? k : 0.0;
+	}
+	return 1;
+}
+
+void OligoArray::dropBallSums() {
+	if (ballCells != NULL) delete []ballCells;
+	ballCells = NULL;
+	ballLevels = 0;
+}
+
+// The screen's sums for an A/C/G/T query with up to misMatches mismatches,
+// from ballCells: returns 1 with vt and vbg set to the unsigned int
+// truncations of the sums sumMisMatchCounts would return and above to
+// (their sum > minCounts), when the two strands' balls are disjoint and
+// the error bound decides all three; returns 0 otherwise.
+int OligoArray::ballSums(const char* seq, int misMatches, double minCounts, double& vt, double& vbg, int& above) {
+	if (ballCells == NULL || misMatches < 1 || misMatches > ballLevels) return 0;
+	int len = oligoLength;
+	uint32_t fwd = 0;
+	uint32_t rv = 0;
+	for (int i=0;i<len;i++) {
+		int c = dnaBaseCode(seq[i]);
+		if (c < 0) return 0;
+		fwd = (fwd << 2) | (uint32_t)c;
+		rv |= (uint32_t)(3-c) << (2*i);
+	}
+	const size_t CS = 2*(ballLevels+1);
+	const double* cf = ballCells + (size_t)fwd*CS + 2*misMatches;
+	double t = cf[0];
+	double g = cf[1];
+	if (rvFlag) {
+		uint32_t d = fwd ^ rv;
+		d = (d | (d >> 1)) & 0x55555555u;
+		if (__builtin_popcount(d) <= 2*misMatches) return 0;
+		const double* cr = ballCells + (size_t)rv*CS + 2*misMatches;
+		t = t + cr[0];
+		g = g + cr[1];
+	}
+	double et = ballErrT[misMatches]*t;
+	double eg = ballErrBg[misMatches]*g;
+	double tlo = t-et;
+	double thi = t+et;
+	double glo = g-eg;
+	double ghi = g+eg;
+	if (tlo < 0.0) tlo = 0.0;
+	if (glo < 0.0) glo = 0.0;
+	if (!(thi < 2147483648.0 && ghi < 2147483648.0)) return 0;
+	double ft = floor(tlo);
+	double fg = floor(glo);
+	if (floor(thi) != ft || floor(ghi) != fg) return 0;
+	double shi = thi+ghi;
+	double slo = tlo+glo;
+	double margin = 4.0*DBL_EPSILON*(shi + fabs(minCounts));
+	if (shi + margin < minCounts) {
+		above = 0;
+	} else if (slo - margin > minCounts + 8.0*DBL_EPSILON*fabs(minCounts)) {
+		above = 1;
+	} else {
+		return 0;
+	}
+	vt = ft;
+	vbg = fg;
+	return 1;
 }
 
 
@@ -1935,11 +3502,21 @@ void OligoArray::sortActiveOligos() {
 	if (activeOligos == NULL || numActiveOligos < 1) return;
 	qsort(activeOligos, numActiveOligos, sizeof(Oligo*), &(Oligo::oligoCmp));
 }
+// Highest cpuData[cpu] first. Stable, so tied oligos keep the order they were
+// found in, as glibc's qsort (a merge sort) left them.
 void OligoArray::sortUtilityOligos(int cpu) {
-	pthread_mutex_lock(&sortMutex);
-	Oligo::cpu = cpu;
-	qsort(utilityOligos[cpu], numUtilityOligos[cpu], sizeof(Oligo*), &(Oligo::oligoCmpReverseParallel));
-	pthread_mutex_unlock(&sortMutex);
+	int n = numUtilityOligos[cpu];
+	Oligo** oligos = utilityOligos[cpu];
+	KeyedOligo* keyed = new KeyedOligo[n];
+	for (int i=0;i<n;i++) {
+		keyed[i].key = oligos[i]->cpuData[cpu];
+		keyed[i].oligo = oligos[i];
+	}
+	std::stable_sort(keyed, keyed+n, [](const KeyedOligo& a, const KeyedOligo& b) {
+		return a.key > b.key;
+	});
+	for (int i=0;i<n;i++) oligos[i] = keyed[i].oligo;
+	delete []keyed;
 }
 void OligoArray::initializeActiveOligoArray() {
 	if (activeOligos != NULL) delete []activeOligos;
@@ -1953,6 +3530,7 @@ void OligoArray::initializeActiveOligoArray() {
 }
 
 int OligoArray::addOligo(char* seq, double vt, double vbg, double addValue) {
+	if (records != NULL) dropRecords();
 	totalTarget += vt;
 	totalBackground += vbg;
 	double tmpT=0.0,tmpBg=0.0;
@@ -1974,6 +3552,495 @@ int OligoArray::addOligo(char* seq, double vt, double vbg, double addValue) {
 	}
 	int added = addOligoTree(seq,vt,vbg,addValue,rvMode,0);
 	rvMode = 0;
+	return added;
+}
+
+namespace {
+struct WindowRec {
+	uint64_t key;  // 2-bit code (base 0 in the top bits), with rvFlag the smaller strand's
+	uint32_t pos;  // text offset of the window
+	uint32_t seq;  // sequence index, for its weights
+};
+struct WindowSums {
+	double numTarget;
+	double numBackground;
+};
+#define WINDOW_MAX_THREADS 256
+// Runs f(0..n-1) on n (at most WINDOW_MAX_THREADS) threads. pthreads with arguments on the caller's stack,
+// so nothing is freed into the heap before the oligos are allocated.
+template <class F> struct WindowThreadArgs {
+	F* f;
+	int t;
+};
+template <class F> void* windowThreadMain(void* a) {
+	WindowThreadArgs<F>* args = (WindowThreadArgs<F>*)a;
+	(*args->f)(args->t);
+	return NULL;
+}
+template <class F> void runWindowThreads(int n, F f) {
+	const int maxThreads = WINDOW_MAX_THREADS;
+	pthread_t threads[maxThreads];
+	WindowThreadArgs<F> args[maxThreads];
+	int started[maxThreads];
+	// Small stacks stay in glibc's stack cache, whose overflow would free the
+	// threads' TLS vectors into the heap.
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	size_t stackSize = 128*1024;
+#ifdef PTHREAD_STACK_MIN
+	if (stackSize < (size_t)PTHREAD_STACK_MIN) stackSize = PTHREAD_STACK_MIN;
+#endif
+	pthread_attr_setstacksize(&attr, stackSize);
+	for (int t=1;t<n;t++) {
+		args[t].f = &f;
+		args[t].t = t;
+		started[t] = (pthread_create(&threads[t], &attr, &windowThreadMain<F>, &args[t]) == 0);
+		if (!started[t]) f(t);
+	}
+	f(0);
+	for (int t=1;t<n;t++) {
+		if (started[t]) pthread_join(threads[t], NULL);
+	}
+	pthread_attr_destroy(&attr);
+}
+}
+
+// The base call's scoring and sort on several threads: see scoreSortUtilityOligos.
+#ifndef BASE_SCORE_MIN_OLIGOS
+#define BASE_SCORE_MIN_OLIGOS 65536
+#endif
+#ifndef BASE_SCORE_SPLIT_DEPTH
+#define BASE_SCORE_SPLIT_DEPTH 4
+#endif
+#ifndef BASE_SORT_MIN_PER_THREAD
+#define BASE_SORT_MIN_PER_THREAD 8192
+#endif
+namespace {
+// A node of the oligo tree to walk, or (node 0) a leaf hit found above the split depth.
+struct ScoreTask {
+	int node;
+	int depth;
+	double fwd;
+	double rv;
+	KeyedOligo leaf;
+};
+// scoreOligosWithMotif's MOTIF_SCORE_OLIGOS walk below node (at depth d0, path sums fwd0 and rv0),
+// visiting the same slots in the same order with the same sums. Each hit is appended to out and
+// its oligo's cpuData[cpu], value and flag are set. With tasks != NULL, a leaf above depth split is
+// appended to tasks as a leaf, and a node about to be entered at depth split as a node to walk.
+static void walkScoreTree(OligoArray* oa, Motif* motif, double minimumScore, int cpu,
+			int d0, int node, double fwd0, double rv0, int split, std::vector<ScoreTask>* tasks,
+			std::vector<KeyedOligo>* out, int* indexS, int* alphaS, double* fwdScoreS, double* rvScoreS) {
+	const int oligoLength = oa->oligoLength;
+	const int alphaSize = oa->alphaSize;
+	const int rvFlag = oa->rvFlag;
+	const int* tree = oa->tree;
+	Oligo** staticOligos = oa->staticOligos;
+	const char* alphaIndex = oa->alphaIndex;
+
+	indexS[d0] = node;
+	alphaS[d0] = 0;
+	fwdScoreS[d0] = fwd0;
+	rvScoreS[d0] = rv0;
+	int stackPosition = d0;
+
+	while (stackPosition >= d0) {
+		int alphaPos = alphaS[stackPosition];
+		if (alphaPos >= alphaSize) {
+			stackPosition--;
+			continue;
+		}
+		int fwdPosition = stackPosition;
+		int rvPosition = oligoLength-fwdPosition-1;
+		double fwdScore = fwdScoreS[stackPosition];
+		double rvScore = rvScoreS[stackPosition];
+		fwdScore += motif->m[fwdPosition][alphaPos];
+		rvScore += motif->m[rvPosition][3-alphaPos];
+
+		if (fwdPosition < oligoLength-1) {
+			if (fwdScore+motif->fwdMaxPossible[fwdPosition+1] < minimumScore) {
+				if (!rvFlag || rvScore+motif->rvMaxPossible[rvPosition-1] < minimumScore) {
+					alphaS[stackPosition]++;
+					continue;
+				}
+			}
+		}
+
+		int valIndex = tree[indexS[stackPosition]+alphaPos];
+		if (valIndex < 0) {
+			int oligoIndex = -valIndex;
+			Oligo* oligo = staticOligos[oligoIndex];
+			char* seq = oligo->seq;
+			for (int i=fwdPosition+1;i<oligoLength;i++) {
+				char bp = seq[i];
+				fwdScore += motif->m[i][(int)alphaIndex[(int)bp]];
+				rvScore += motif->m[oligoLength-i-1][3-alphaIndex[(int)bp]];
+			}
+			double bestScore = fwdScore;
+			char direction = 0;
+			if (fwdScore < rvScore && rvFlag) {
+				bestScore = rvScore;
+				direction = 1;
+			}
+			oligo->cpuData[cpu] = bestScore;
+			oligo->value = bestScore;
+			oligo->flag = direction;
+			KeyedOligo hit;
+			hit.key = bestScore;
+			hit.oligo = oligo;
+			if (tasks != NULL) {
+				ScoreTask task;
+				task.node = 0;
+				task.depth = fwdPosition;
+				task.fwd = 0.0;
+				task.rv = 0.0;
+				task.leaf = hit;
+				tasks->push_back(task);
+			} else {
+				out->push_back(hit);
+			}
+			alphaS[stackPosition]++;
+		} else if (valIndex == 0) {
+			alphaS[stackPosition]++;
+		} else if (tasks != NULL && stackPosition+1 == split) {
+			ScoreTask task;
+			task.node = valIndex;
+			task.depth = split;
+			task.fwd = fwdScore;
+			task.rv = rvScore;
+			task.leaf.key = 0.0;
+			task.leaf.oligo = NULL;
+			tasks->push_back(task);
+			alphaS[stackPosition]++;
+		} else {
+			alphaS[stackPosition+1] = 0;
+			indexS[stackPosition+1] = valIndex;
+			fwdScoreS[stackPosition+1] = fwdScore;
+			rvScoreS[stackPosition+1] = rvScore;
+			alphaS[stackPosition]++;
+			stackPosition++;
+		}
+	}
+}
+static inline void storeKeyedOut(KeyedOligo* o, const KeyedOligo& x) { *o = x; }
+static inline void storeKeyedOut(Oligo** o, const KeyedOligo& x) { *o = x.oligo; }
+// Writes the stable merge of the runs a[0..na) and b[0..nb), each sorted highest key first
+// (ties from a first), at positions [k0, k1) of the merged order to out.
+template <class Out> static void mergeKeyedDescending(const KeyedOligo* a, int na,
+			const KeyedOligo* b, int nb, int k0, int k1, Out* out) {
+	// how many of the first k outputs come from a
+	auto split = [&](int k) {
+		int lo = k - nb > 0 ? k - nb : 0;
+		int hi = k < na ? k : na;
+		while (lo < hi) {
+			int mid = lo + (hi-lo)/2;
+			if (a[mid].key >= b[k-mid-1].key) lo = mid+1;
+			else hi = mid;
+		}
+		return lo;
+	};
+	int i = split(k0);
+	int j = k0 - i;
+	int iEnd = split(k1);
+	int jEnd = k1 - iEnd;
+	Out* o = out + k0;
+	while (i < iEnd && j < jEnd) {
+		if (b[j].key > a[i].key) storeKeyedOut(o++, b[j++]);
+		else storeKeyedOut(o++, a[i++]);
+	}
+	while (i < iEnd) storeKeyedOut(o++, a[i++]);
+	while (j < jEnd) storeKeyedOut(o++, b[j++]);
+}
+}
+
+// scoreOligosWithMotif(motif, minimumScore, MOTIF_SCORE_OLIGOS, cpu) then sortUtilityOligos(cpu),
+// on up to numCPUs threads, with the same result: the tree is cut into the nodes at depth
+// BASE_SCORE_SPLIT_DEPTH (and the leaves above it), which threads walk in any order, each with its
+// own stacks and hit list; one leaf per oligo, so no two threads write one oligo. The lists joined
+// in tree order are the serial walk's, and they are sorted in chunks with std::stable_sort and
+// merged pairwise, ties from the left, which is std::stable_sort's order. A NaN key, for which that
+// order depends on the algorithm, sorts the whole list with std::stable_sort instead.
+// For DeNovoMotifs' base call, which runs while no other thread uses the oligos.
+void OligoArray::scoreSortUtilityOligos(Motif* motif, double minimumScore, int cpu) {
+	int T = numCPUs;
+	if (T > WINDOW_MAX_THREADS) T = WINDOW_MAX_THREADS;
+	int split = BASE_SCORE_SPLIT_DEPTH;
+	if (T < 2 || numOligos < BASE_SCORE_MIN_OLIGOS || alphaSize != 4 || oligoLength <= split) {
+		scoreOligosWithMotif(motif,minimumScore,MOTIF_SCORE_OLIGOS,cpu);
+		sortUtilityOligos(cpu);
+		return;
+	}
+	motif->logxform();
+
+	std::vector<ScoreTask> tasks;
+	{
+		std::vector<int> iS(oligoLength+1), aS(oligoLength+1);
+		std::vector<double> fS(oligoLength+1), rS(oligoLength+1);
+		walkScoreTree(this,motif,minimumScore,cpu,0,0,0.0,0.0,split,&tasks,NULL,
+						iS.data(),aS.data(),fS.data(),rS.data());
+	}
+	int numTasks = (int)tasks.size();
+	std::vector<std::vector<KeyedOligo> > outs(numTasks);
+	std::atomic<int> nextTask(0);
+	auto walkTasks = [&](int t) {
+		(void)t;
+		std::vector<int> iS(oligoLength+1), aS(oligoLength+1);
+		std::vector<double> fS(oligoLength+1), rS(oligoLength+1);
+		for (;;) {
+			int k = nextTask.fetch_add(1);
+			if (k >= numTasks) break;
+			const ScoreTask& task = tasks[k];
+			if (task.node == 0) {
+				outs[k].push_back(task.leaf);
+			} else {
+				walkScoreTree(this,motif,minimumScore,cpu,task.depth,task.node,task.fwd,task.rv,0,NULL,
+						&outs[k],iS.data(),aS.data(),fS.data(),rS.data());
+			}
+		}
+	};
+	runWindowThreads(T, walkTasks);
+
+	std::vector<int64_t> offset(numTasks+1, 0);
+	for (int k=0;k<numTasks;k++) offset[k+1] = offset[k] + (int64_t)outs[k].size();
+	int n = (int)offset[numTasks];
+	numUtilityOligos[cpu] = n;
+	Oligo** oligos = utilityOligos[cpu];
+	if (n < 1) return;
+
+	int S = n / BASE_SORT_MIN_PER_THREAD;
+	if (S > T) S = T;
+	if (S < 1) S = 1;
+	KeyedOligo* keyed = new KeyedOligo[n];
+	std::vector<int> runs(S+1);
+	for (int s=0;s<=S;s++) runs[s] = (int)(((int64_t)n*s)/S);
+	std::vector<char> hasNaN(S, 0);
+	auto less = [](const KeyedOligo& a, const KeyedOligo& b) {
+		return a.key > b.key;
+	};
+	// gathers the joined lists' positions [runs[s], runs[s+1]) and sorts them
+	auto sortChunk = [&](int s) {
+		int start = runs[s], end = runs[s+1];
+		int k = (int)(std::upper_bound(offset.begin(), offset.end(), (int64_t)start) - offset.begin()) - 1;
+		char nan = 0;
+		for (int i=start;i<end;) {
+			while (offset[k+1] <= i) k++;
+			const KeyedOligo* src = outs[k].data() + (i - offset[k]);
+			int stop = (int)offset[k+1] < end ? (int)offset[k+1] : end;
+			for (;i<stop;i++,src++) {
+				if (src->key != src->key) nan = 1;
+				keyed[i] = *src;
+			}
+		}
+		hasNaN[s] = nan;
+		if (!nan) std::stable_sort(keyed+start, keyed+end, less);
+	};
+	if (S == 1) sortChunk(0);
+	else runWindowThreads(S, sortChunk);
+	int anyNaN = 0;
+	for (int s=0;s<S;s++) if (hasNaN[s]) anyNaN = 1;
+	if (anyNaN) {
+		// the chunks holding no NaN were sorted, so join the lists again
+		for (int k=0;k<numTasks;k++) {
+			for (size_t i=0;i<outs[k].size();i++) keyed[offset[k]+i] = outs[k][i];
+		}
+		std::stable_sort(keyed, keyed+n, less);
+		for (int i=0;i<n;i++) oligos[i] = keyed[i].oligo;
+		delete []keyed;
+		return;
+	}
+	if (S == 1) {
+		for (int i=0;i<n;i++) oligos[i] = keyed[i].oligo;
+		delete []keyed;
+		return;
+	}
+	// rounds of pairwise merges, each split into S pieces; the last one writes the oligos
+	KeyedOligo* src = keyed;
+	KeyedOligo* dst = (S > 2) ? new KeyedOligo[n] : NULL;
+	KeyedOligo* other = dst;
+	while (runs.size() > 2) {
+		int numRuns = (int)runs.size()-1;
+		int numPairs = (numRuns+1)/2;
+		int pieces = S/numPairs;
+		if (pieces < 1) pieces = 1;
+		int numMergeTasks = numPairs*pieces;
+		int last = (numRuns == 2);
+		auto mergeTask = [&](int t) {
+			for (int task=t;task<numMergeTasks;task+=S) {
+				int p = task / pieces;
+				int q = task % pieces;
+				int aStart = runs[2*p];
+				int aEnd = runs[2*p+1];
+				int bEnd = (2*p+2 <= numRuns) ? runs[2*p+2] : aEnd;
+				int m = bEnd - aStart;
+				int k0 = (int)(((int64_t)m*q)/pieces);
+				int k1 = (int)(((int64_t)m*(q+1))/pieces);
+				if (last) {
+					mergeKeyedDescending(src+aStart, aEnd-aStart, src+aEnd, bEnd-aEnd, k0, k1, oligos+aStart);
+				} else {
+					mergeKeyedDescending(src+aStart, aEnd-aStart, src+aEnd, bEnd-aEnd, k0, k1, other+aStart);
+				}
+			}
+		};
+		runWindowThreads(S, mergeTask);
+		std::vector<int> next;
+		for (int r=0;r<=numRuns;r+=2) next.push_back(runs[r]);
+		if (next.back() != n) next.push_back(n);
+		runs.swap(next);
+		KeyedOligo* tmp = src;
+		src = other;
+		other = tmp;
+	}
+	delete []keyed;
+	if (dst != NULL) delete []dst;
+}
+
+// Adds every window of the sequences that holds no N, as calling addOligo(window,
+// pv[s], nv[s], -1.0) on each in scan order would on an empty array, apart from
+// totalTarget/totalBackground, which the caller sums. The tree depends only on
+// which new oligos are inserted in which order, and an oligo's counts only on
+// the order of its own additions, so the windows are grouped by oligo on
+// numThreads threads (each group in scan order), and the oligos are inserted in
+// order of first occurrence, as that occurrence reads, with their summed counts.
+// Needs DNA, oligoLength 1-32, text of ACGTN only, shorter than 2^32 bytes, and
+// fewer than 2^31 windows; goodStart[s] is the number of good windows before
+// sequence s. Returns the number of oligos added.
+int OligoArray::addSequenceWindows(const char* text, int numSeqs, const uint32_t* seqStart,
+			const int* seqLen, const uint64_t* goodStart, const double* pv, const double* nv,
+			int numThreads) {
+	if (records != NULL) dropRecords();
+	const uint64_t W = goodStart[numSeqs];
+	if (W == 0) return 0;
+	const int L = oligoLength;
+	const int T = numThreads < 1 ? 1 : (numThreads > WINDOW_MAX_THREADS ? WINDOW_MAX_THREADS : numThreads);
+	const uint64_t mask = (L == 32) ? ~0ULL : ((1ULL << (2*L))-1);
+	const int topShift = 2*(L-1);
+	const int bucketBits = (2*L < 12) ? 2*L : 12;
+	const int bucketShift = 2*L - bucketBits;
+	const int numBuckets = 1 << bucketBits;
+	const int both = rvFlag;
+	uint64_t textSize = (uint64_t)seqStart[numSeqs-1] + (uint64_t)seqLen[numSeqs-1];
+
+	WindowRec* rec = new WindowRec[W];
+	WindowRec* dst = new WindowRec[W];
+	std::vector<int> seqSplit(T+1);
+	for (int t=0;t<=T;t++) {
+		uint64_t target = W*(uint64_t)t/(uint64_t)T;
+		seqSplit[t] = (int)(std::lower_bound(goodStart, goodStart+numSeqs+1, target)-goodStart);
+	}
+	seqSplit[T] = numSeqs;
+	std::vector<uint32_t> hist((size_t)T*numBuckets, 0);
+
+	// each thread codes its sequences' windows and counts them per bucket
+	runWindowThreads(T, [&](int t) {
+		uint32_t* h = &hist[(size_t)t*numBuckets];
+		for (int s=seqSplit[t];s<seqSplit[t+1];s++) {
+			const char* p = text + seqStart[s];
+			int n = seqLen[s];
+			uint64_t r = goodStart[s];
+			uint64_t fwd = 0, rc = 0;
+			int run = 0;
+			for (int i=0;i<n;i++) {
+				int c = dnaBaseCode(p[i]);
+				if (c < 0) {
+					run = 0;
+					continue;
+				}
+				fwd = ((fwd << 2) | (uint64_t)c) & mask;
+				rc = (rc >> 2) | ((uint64_t)(3-c) << topShift);
+				if (++run < L) continue;
+				uint64_t key = (both && rc < fwd) ? rc : fwd;
+				rec[r].key = key;
+				rec[r].pos = seqStart[s] + (uint32_t)(i-L+1);
+				rec[r].seq = (uint32_t)s;
+				r++;
+				h[key >> bucketShift]++;
+			}
+		}
+	});
+
+	// stable scatter into buckets: bucket-major, thread order within a bucket
+	std::vector<uint64_t> bucketStart(numBuckets+1, 0);
+	std::vector<uint64_t> offset((size_t)T*numBuckets);
+	uint64_t total = 0;
+	for (int b=0;b<numBuckets;b++) {
+		bucketStart[b] = total;
+		for (int t=0;t<T;t++) {
+			offset[(size_t)t*numBuckets+b] = total;
+			total += hist[(size_t)t*numBuckets+b];
+		}
+	}
+	bucketStart[numBuckets] = total;
+	runWindowThreads(T, [&](int t) {
+		uint64_t* off = &offset[(size_t)t*numBuckets];
+		for (uint64_t r=goodStart[seqSplit[t]];r<goodStart[seqSplit[t+1]];r++) {
+			dst[off[rec[r].key >> bucketShift]++] = rec[r];
+		}
+	});
+
+	// per bucket: sort by (oligo, position); each oligo's counts summed in scan
+	// order into rec (free again), and slot[first position] names that entry
+	// (+1), with the top bit set when the oligo occurs more than once
+	WindowSums* sums = (WindowSums*)rec;
+	uint32_t* slot = (uint32_t*)calloc(textSize, sizeof(uint32_t));
+	const uint32_t lastPos = rec[W-1].pos;
+	std::atomic<int> nextBucket(0);
+	std::atomic<long long> lastEntry(-1);
+	runWindowThreads(T, [&](int t) {
+		(void)t;
+		int b;
+		while ((b = nextBucket.fetch_add(1)) < numBuckets) {
+			WindowRec* lo = dst + bucketStart[b];
+			WindowRec* hi = dst + bucketStart[b+1];
+			std::sort(lo, hi, [](const WindowRec& x, const WindowRec& y) {
+				return x.key < y.key || (x.key == y.key && x.pos < y.pos);
+			});
+			uint64_t e = bucketStart[b];
+			for (WindowRec* g=lo;g<hi;) {
+				WindowRec* end = g;
+				double vt = 0.0, vbg = 0.0;
+				while (end < hi && end->key == g->key) {
+					vt += pv[end->seq];
+					vbg += nv[end->seq];
+					end++;
+				}
+				sums[e].numTarget = vt;
+				sums[e].numBackground = vbg;
+				slot[g->pos] = (uint32_t)(e+1) | ((end-g > 1) ? 0x80000000u : 0u);
+				if ((end-1)->pos == lastPos) lastEntry.store((long long)e);
+				e++;
+				g = end;
+			}
+		}
+	});
+
+	// insert in order of first occurrence
+	char* buf = new char[L+1];
+	buf[L] = '\0';
+	int added = 0;
+	int lastNumber = 0;
+	for (uint64_t p=0;p<textSize;p++) {
+		uint32_t v = slot[p];
+		if (v == 0) continue;
+		uint64_t e = (v & 0x7fffffffu)-1;
+		memcpy(buf, text+p, L);
+		added += addOligoTree(buf, sums[e].numTarget, sums[e].numBackground, -1.0, 0, 0);
+		Oligo* o = staticOligos[numOligos];
+		// addOligo's search hits an oligo at every later occurrence
+		if (v & 0x80000000u) o->flag = 1;
+		if ((long long)e == lastEntry.load()) lastNumber = numOligos;
+	}
+	// the cpu-0 search state addOligo leaves: the last window's search
+	if (lastNumber > 0 && (slot[lastPos] == 0)) {
+		numUtilityOligos[0] = 1;
+		firstHit[0][0] = lastNumber;
+	} else {
+		numUtilityOligos[0] = 0;
+		firstHit[0][0] = 0;
+	}
+	delete []buf;
+	free(slot);
+	delete []dst;
+	delete []rec;
 	return added;
 }
 
@@ -2093,10 +4160,14 @@ void OligoArray::adjustOligoInstances(char* seq, double vt, double vbg) {
 	double tmp1, tmp2;
 	int cpu = 0;
 	int maxMisMatches = 0;
-	int found = searchOligo(seq, maxMisMatches, tmp1, tmp2, OLIGO_SEARCH_KEEP,cpu);
+	int found = findExactOligo(seq, cpu);
+	if (found < 0) found = searchOligo(seq, maxMisMatches, tmp1, tmp2, OLIGO_SEARCH_KEEP,cpu);
 	if (found < 1) return;
 	if (found > 1) {
 		fprintf(stderr, "!!! Somthing is probably wrong... duplicates in the oligoarray\n");
+	}
+	if (trackChanges) {
+		for (int i=0;i<found;i++) recordChangedOligo(utilityOligos[cpu][i]);
 	}
 	double normWeight = utilityOligos[cpu][0]->normWeight;
 	utilityOligos[cpu][0]->numTarget += vt;
@@ -2112,21 +4183,139 @@ void OligoArray::adjustOligoInstances(char* seq, double vt, double vbg) {
 	} else {
 		remove = 0;
 	}
+	if (records != NULL) {
+		OligoRecord& r = records[firstHit[cpu][0]];
+		r.numTarget = utilityOligos[cpu][0]->numTarget;
+		r.numBackground = utilityOligos[cpu][0]->numBackground;
+	}
+	if (snapContributions && countsUsable) {
+		double t = utilityOligos[cpu][0]->numTarget;
+		double g = utilityOligos[cpu][0]->numBackground;
+		countsTotalT += fabs(vt);
+		countsTotalBg += fabs(vbg*normWeight);
+		if (!(t >= 0.0 && t <= DBL_MAX && g >= 0.0 && g <= DBL_MAX)) countsUsable = 0;
+		if (t != floor(t) || !(countsTotalT < COUNT_SUMS_EXACT_LIMIT)) countsExactT = 0;
+		if (g != floor(g) || !(countsTotalBg < COUNT_SUMS_EXACT_LIMIT)) countsExactBg = 0;
+	}
 	if (remove) {
 		//all instances of the oligo have been removed, so get it out of the tree
 		found = searchOligo(seq, maxMisMatches, tmp1, tmp2, OLIGO_SEARCH_REMOVE,cpu);
+		if (trackChanges) {
+			for (int i=0;i<found;i++) recordChangedOligo(utilityOligos[cpu][i]);
+		}
 	}
+}
+
+void OligoArray::recordChangedOligo(Oligo* oligo) {
+	if (oligo->changed) return;
+	if (numChangedOligos == maxChangedOligos) {
+		int newMax = (maxChangedOligos < 1024) ? 1024 : maxChangedOligos*2;
+		Oligo** grown = new Oligo*[newMax];
+		for (int i=0;i<numChangedOligos;i++) grown[i] = changedOligos[i];
+		if (changedOligos != NULL) delete []changedOligos;
+		changedOligos = grown;
+		double* grownSnap = new double[2*(size_t)newMax];
+		if (changedSnap != NULL) {
+			for (int i=0;i<2*numChangedOligos;i++) grownSnap[i] = changedSnap[i];
+			delete []changedSnap;
+		}
+		changedSnap = grownSnap;
+		maxChangedOligos = newMax;
+	}
+	oligo->changed = 1;
+	double t = NAN, g = NAN;
+	if (snapContributions && !oligoContribution(oligo, t, g)) t = g = NAN;
+	changedSnap[2*numChangedOligos] = t;
+	changedSnap[2*numChangedOligos+1] = g;
+	changedOligos[numChangedOligos++] = oligo;
+}
+
+// What the oligo adds to every mismatch sum whose ball holds its code: its
+// record's counts while the code table maps its code to it, else 0.
+// Returns 0 when that cannot be read (no table, not A/C/G/T).
+int OligoArray::oligoContribution(Oligo* oligo, double& vt, double& vbg) {
+	vt = 0.0;
+	vbg = 0.0;
+	if (codeTableState != 1 || records == NULL || oligo == NULL) return 0;
+	uint32_t key = 0;
+	for (int i=0;i<oligoLength;i++) {
+		int c = dnaBaseCode(oligo->seq[i]);
+		if (c < 0) return 0;
+		key = (key << 2) | (uint32_t)c;
+	}
+	int index = codeTable[key];
+	if (index != 0 && records[index].oligo == oligo) {
+		vt = records[index].numTarget;
+		vbg = records[index].numBackground;
+	}
+	return 1;
+}
+
+void OligoArray::scanCountSums() {
+	countsUsable = 0;
+	countsExactT = 0;
+	countsExactBg = 0;
+	countsTotalT = 0.0;
+	countsTotalBg = 0.0;
+	if (records == NULL) return;
+	int integerT = 1, integerBg = 1;
+	double totalT = 0.0, totalBg = 0.0;
+	for (int i=1;i<=numOligos;i++) {
+		double t = records[i].numTarget;
+		double g = records[i].numBackground;
+		if (!(t >= 0.0 && t <= DBL_MAX && g >= 0.0 && g <= DBL_MAX)) return;
+		if (t != floor(t)) integerT = 0;
+		if (g != floor(g)) integerBg = 0;
+		totalT += t;
+		totalBg += g;
+	}
+	countsUsable = 1;
+	countsTotalT = totalT;
+	countsTotalBg = totalBg;
+	countsExactT = integerT && totalT < COUNT_SUMS_EXACT_LIMIT;
+	countsExactBg = integerBg && totalBg < COUNT_SUMS_EXACT_LIMIT;
+}
+
+void OligoArray::clearChangedOligos() {
+	for (int i=0;i<numChangedOligos;i++) changedOligos[i]->changed = 0;
+	numChangedOligos = 0;
 }
 
 int OligoArray::searchOligo(char* seq,int maxMisMatches, double& vt, double& vbg, 
 															int removeFlag,int cpu) {
-	
-	numUtilityOligos[cpu] = 0;
 
-	indexStack[cpu][0] = 0;
-	alphaStack[cpu][0] = 0;
-	fwdMisMatchStack[cpu][0] = 0;
-	rvMisMatchStack[cpu][0] = 0;
+	// The hit count stays local and is stored once, since numUtilityOligos
+	// shares one cache line among all threads.
+	int* indexS = indexStack[cpu];
+	int* alphaS = alphaStack[cpu];
+	int* fwdMisMatchS = fwdMisMatchStack[cpu];
+	int* rvMisMatchS = rvMisMatchStack[cpu];
+	Oligo** hits = utilityOligos[cpu];
+	int numHits = 0;
+	int firstHitIndex = 0;
+
+	// With records, a leaf compares the query's codes (forward and reverse
+	// complement) with the oligo's; a query base other than A/C/G/T (N
+	// included) falls back to comparing the strings.
+	OligoRecord* recs = records;
+	uint64_t fwdCode = 0;
+	uint64_t rvCode = 0;
+	if (recs != NULL) {
+		for (int i=0;i<oligoLength;i++) {
+			int c = dnaBaseCode(seq[i]);
+			if (c < 0) {
+				recs = NULL;
+				break;
+			}
+			fwdCode |= (uint64_t)c << (2*i);
+			rvCode |= (uint64_t)(3-c) << (2*(oligoLength-1-i));
+		}
+	}
+
+	indexS[0] = 0;
+	alphaS[0] = 0;
+	fwdMisMatchS[0] = 0;
+	rvMisMatchS[0] = 0;
 	int stackPosition = 0;
 	int valIndex = 0;
 	int oligoIndex = 0;
@@ -2138,16 +4327,16 @@ int OligoArray::searchOligo(char* seq,int maxMisMatches, double& vt, double& vbg
 	while (stackPosition > -1) {
 
 
-		alphaPos = alphaStack[cpu][stackPosition];
+		alphaPos = alphaS[stackPosition];
 
 		if (alphaPos >= alphaSize) {
 			if (removeFlag == OLIGO_SEARCH_REMOVE) {
 				int numEmpty = 0;
 				for (int i=0;i<alphaSize;i++) {
-					if (tree[indexStack[cpu][stackPosition]+i] == 0) numEmpty++;
+					if (tree[indexS[stackPosition]+i] == 0) numEmpty++;
 				}
 				if (numEmpty == alphaSize && stackPosition > 0) {
-					tree[indexStack[cpu][stackPosition-1]+alphaStack[cpu][stackPosition-1]]=0;
+					clearTreeSlot(indexS[stackPosition-1]+alphaS[stackPosition-1]);
 				}
 			}
 			stackPosition--;
@@ -2155,8 +4344,8 @@ int OligoArray::searchOligo(char* seq,int maxMisMatches, double& vt, double& vbg
 		}
 
 
-		fwdMisMatch = fwdMisMatchStack[cpu][stackPosition];
-		rvMisMatch = rvMisMatchStack[cpu][stackPosition];
+		fwdMisMatch = fwdMisMatchS[stackPosition];
+		rvMisMatch = rvMisMatchS[stackPosition];
 
 		if (rvFlag) {
 			if ('N' != seq[oligoLength-stackPosition-1]) {
@@ -2170,75 +4359,109 @@ int OligoArray::searchOligo(char* seq,int maxMisMatches, double& vt, double& vbg
 
 		if (fwdMisMatch > maxMisMatches) {
 			if (!rvFlag || rvMisMatch > maxMisMatches) {
-				alphaStack[cpu][stackPosition]++;
+				alphaS[stackPosition]++;
 				continue;
 			}
 		}
 
-		valIndex = tree[indexStack[cpu][stackPosition]+alphaPos];
+		valIndex = tree[indexS[stackPosition]+alphaPos];
 		if (valIndex < 0) {
 			oligoIndex = -valIndex;
 			//this is a pointer to an oligo
 			//check if equal
-			char* otherSeq = staticOligos[oligoIndex]->seq;
-	
-			for (int i=stackPosition+1;i<oligoLength;i++) {
-				if (seq[i] != 'N' && seq[i] != otherSeq[i]) {
-					fwdMisMatch++;
-					if (fwdMisMatch > maxMisMatches) break;
+			int hit = 0;
+			if (recs != NULL) {
+				const OligoRecord& r = recs[oligoIndex];
+				uint64_t rest = remainMask[stackPosition];
+				uint64_t d = fwdCode ^ r.code;
+				hit = (fwdMisMatch + countMarkedFields((d | (d >> 1)) & rest) <= maxMisMatches);
+				if (!hit && rvFlag) {
+					d = rvCode ^ r.code;
+					hit = (rvMisMatch + countMarkedFields((d | (d >> 1)) & rest) <= maxMisMatches);
 				}
-			}
-			if (rvFlag) {
+				if (hit) {
+					vt += r.numTarget;
+					vbg += r.numBackground;
+					r.oligo->flag = 1;
+					if (numHits == 0) firstHitIndex = oligoIndex;
+					hits[numHits++] = r.oligo;
+				}
+			} else {
+				char* otherSeq = staticOligos[oligoIndex]->seq;
+		
 				for (int i=stackPosition+1;i<oligoLength;i++) {
-					if (seq[oligoLength-i-1] != 'N' && rvMap[(int)seq[oligoLength-i-1]] != otherSeq[i]) {
-						rvMisMatch++;
-						if (rvMisMatch > maxMisMatches) break;
+					if (seq[i] != 'N' && seq[i] != otherSeq[i]) {
+						fwdMisMatch++;
+						if (fwdMisMatch > maxMisMatches) break;
 					}
 				}
-			}
+				if (rvFlag) {
+					for (int i=stackPosition+1;i<oligoLength;i++) {
+						if (seq[oligoLength-i-1] != 'N' && rvMap[(int)seq[oligoLength-i-1]] != otherSeq[i]) {
+							rvMisMatch++;
+							if (rvMisMatch > maxMisMatches) break;
+						}
+					}
+				}
 
-			if (fwdMisMatch <= maxMisMatches || (rvFlag && rvMisMatch <= maxMisMatches)) {
-				vt += staticOligos[oligoIndex]->numTarget;
-				vbg += staticOligos[oligoIndex]->numBackground;
-				staticOligos[oligoIndex]->flag = 1;
-				utilityOligos[cpu][numUtilityOligos[cpu]++] = staticOligos[oligoIndex];
-//fprintf(stderr, "\t%s\t%lf\t%lf\n", otherSeq,vt,vbg);
-				if (removeFlag == OLIGO_SEARCH_REMOVE) {
-					tree[indexStack[cpu][stackPosition]+alphaPos] = 0;
+				if (fwdMisMatch <= maxMisMatches || (rvFlag && rvMisMatch <= maxMisMatches)) {
+					vt += staticOligos[oligoIndex]->numTarget;
+					vbg += staticOligos[oligoIndex]->numBackground;
+					staticOligos[oligoIndex]->flag = 1;
+					if (numHits == 0) firstHitIndex = oligoIndex;
+					hits[numHits++] = staticOligos[oligoIndex];
+					hit = 1;
 				}
 			}
-			alphaStack[cpu][stackPosition]++;
+			if (hit && removeFlag == OLIGO_SEARCH_REMOVE) {
+				clearTreeSlot(indexS[stackPosition]+alphaPos);
+			}
+			alphaS[stackPosition]++;
 			continue;
 		} else if (valIndex == 0) {
 			//dead end
-			alphaStack[cpu][stackPosition]++;
+			alphaS[stackPosition]++;
 			continue;
 		} else {
 			//next node
-			alphaStack[cpu][stackPosition+1]=0;
-			indexStack[cpu][stackPosition+1]=valIndex;
-			fwdMisMatchStack[cpu][stackPosition+1]=fwdMisMatch;
-			rvMisMatchStack[cpu][stackPosition+1]=rvMisMatch;
+			alphaS[stackPosition+1]=0;
+			indexS[stackPosition+1]=valIndex;
+			fwdMisMatchS[stackPosition+1]=fwdMisMatch;
+			rvMisMatchS[stackPosition+1]=rvMisMatch;
 
-			alphaStack[cpu][stackPosition]++;
+			alphaS[stackPosition]++;
 			stackPosition++;
 
 			continue;
 		}
 	}
-	return numUtilityOligos[cpu];
+	numUtilityOligos[cpu] = numHits;
+	firstHit[cpu][0] = firstHitIndex;
+	return numHits;
 } 
 
 void OligoArray::scoreOligosWithMotif(Motif* motif, double minimumScore, int removeFlag, int cpu) {
 
 	motif->logxform();
-	numUtilityOligos[cpu]=0;
-	
-	indexStack[cpu][0] = 0;
-	alphaStack[cpu][0] = 0;
+	if (records != NULL && motif->length == oligoLength) {
+		scoreOligosWithMotifRecords(motif,minimumScore,removeFlag,cpu);
+		return;
+	}
+
+	// The hit count stays local and is stored once, since numUtilityOligos
+	// shares one cache line among all threads.
+	int* indexS = indexStack[cpu];
+	int* alphaS = alphaStack[cpu];
+	double* fwdScoreS = fwdScoreStack[cpu];
+	double* rvScoreS = rvScoreStack[cpu];
+	Oligo** hits = utilityOligos[cpu];
+	int numHits = 0;
+
+	indexS[0] = 0;
+	alphaS[0] = 0;
 	positionStack[cpu][0] = oligoLength-1;
-	fwdScoreStack[cpu][0] = 0.0;
-	rvScoreStack[cpu][0] = 0.0;
+	fwdScoreS[0] = 0.0;
+	rvScoreS[0] = 0.0;
 
 	int stackPosition = 0;
 	int valIndex = 0;
@@ -2253,15 +4476,15 @@ void OligoArray::scoreOligosWithMotif(Motif* motif, double minimumScore, int rem
 
 	while (stackPosition > -1) {
 
-		alphaPos = alphaStack[cpu][stackPosition];
+		alphaPos = alphaS[stackPosition];
 		if (alphaPos >= alphaSize) {
 			if (removeFlag == MOTIF_REMOVE_OLIGOS) {
 				int numEmpty = 0;
 				for (int i=0;i<alphaSize;i++) {
-					if (tree[indexStack[cpu][stackPosition]+i] == 0) numEmpty++;
+					if (tree[indexS[stackPosition]+i] == 0) numEmpty++;
 				}
 				if (numEmpty == alphaSize && stackPosition > 0) {
-					tree[indexStack[cpu][stackPosition-1]+alphaStack[cpu][stackPosition-1]]=0;
+					clearTreeSlot(indexS[stackPosition-1]+alphaS[stackPosition-1]);
 				}
 			}
 			stackPosition--;
@@ -2271,8 +4494,8 @@ void OligoArray::scoreOligosWithMotif(Motif* motif, double minimumScore, int rem
 		fwdPosition = stackPosition;
 		rvPosition = oligoLength-fwdPosition-1;
 
-		fwdScore = fwdScoreStack[cpu][stackPosition];
-		rvScore = rvScoreStack[cpu][stackPosition];
+		fwdScore = fwdScoreS[stackPosition];
+		rvScore = rvScoreS[stackPosition];
 
 		fwdScore += motif->m[fwdPosition][alphaPos];
 		rvScore += motif->m[rvPosition][3-alphaPos];
@@ -2280,13 +4503,13 @@ void OligoArray::scoreOligosWithMotif(Motif* motif, double minimumScore, int rem
 		if (fwdPosition < oligoLength-1) {
 			if (fwdScore+motif->fwdMaxPossible[fwdPosition+1] < minimumScore) {
 				if (!rvFlag || rvScore+motif->rvMaxPossible[rvPosition-1] < minimumScore) {
-					alphaStack[cpu][stackPosition]++;
+					alphaS[stackPosition]++;
 					continue;
 				}
 			}
 		}
 
-		valIndex = tree[indexStack[cpu][stackPosition]+alphaPos];
+		valIndex = tree[indexS[stackPosition]+alphaPos];
 		if (valIndex < 0) {
 			oligoIndex = -valIndex;
 			//this is a pointer to an oligo
@@ -2310,31 +4533,497 @@ void OligoArray::scoreOligosWithMotif(Motif* motif, double minimumScore, int rem
 			if (removeFlag == MOTIF_REMOVE_OLIGOS) {
 				if (bestScore >= motif->threshold) {
 					//fprintf(stderr, "\t\t\t%s\n", staticOligos[oligoIndex]->seq);
-					tree[indexStack[cpu][stackPosition]+alphaPos] = 0;
+					clearTreeSlot(indexS[stackPosition]+alphaPos);
 				}
 			}
-			utilityOligos[cpu][numUtilityOligos[cpu]] = staticOligos[oligoIndex];
-			numUtilityOligos[cpu]++;
-			alphaStack[cpu][stackPosition]++;
+			hits[numHits++] = staticOligos[oligoIndex];
+			alphaS[stackPosition]++;
 			continue;
 		} else if (valIndex == 0) {
 			//dead end
-			alphaStack[cpu][stackPosition]++;
+			alphaS[stackPosition]++;
 			continue;
 		} else {
 			//next node
-			alphaStack[cpu][stackPosition+1]=0;
-			indexStack[cpu][stackPosition+1]=valIndex;
-			fwdScoreStack[cpu][stackPosition+1]=fwdScore;
-			rvScoreStack[cpu][stackPosition+1]=rvScore;
+			alphaS[stackPosition+1]=0;
+			indexS[stackPosition+1]=valIndex;
+			fwdScoreS[stackPosition+1]=fwdScore;
+			rvScoreS[stackPosition+1]=rvScore;
 
-			alphaStack[cpu][stackPosition]++;
+			alphaS[stackPosition]++;
 
 			stackPosition++;
 
 			continue;
 		}
 	}
+	numUtilityOligos[cpu] = numHits;
+}
+
+// The two strands' log-odds of a DNA motif as flat tables over len positions: fwdT[i*4+b] = m[i][b]
+// and rvT[i*4+b] = m[len-1-i][3-b], the reverse strand's term for base b at position i.
+static inline void fillWalkTables(double** m, int len, double* fwdT, double* rvT) {
+	for (int i=0;i<len;i++) {
+		for (int b=0;b<4;b++) {
+			fwdT[i*4+b] = m[i][b];
+			rvT[i*4+b] = m[len-1-i][3-b];
+		}
+	}
+}
+
+// scoreOligosWithMotif with records (DNA, -len 1-32): a leaf's remaining bases come from its
+// record's code and every score term from the flat tables, so a leaf reads one record instead of
+// staticOligos[], the Oligo and its seq. The same doubles are added in the same position order.
+void OligoArray::scoreOligosWithMotifRecords(Motif* motif, double minimumScore, int removeFlag, int cpu) {
+
+	const int len = oligoLength;
+	double fwdT[4*32];
+	double rvT[4*32];
+	fillWalkTables(motif->m,len,fwdT,rvT);
+	const double* fwdMax = motif->fwdMaxPossible;
+	const double* rvMax = motif->rvMaxPossible;
+	const OligoRecord* recs = records;
+
+	int* indexS = indexStack[cpu];
+	int* alphaS = alphaStack[cpu];
+	double* fwdScoreS = fwdScoreStack[cpu];
+	double* rvScoreS = rvScoreStack[cpu];
+	Oligo** hits = utilityOligos[cpu];
+	int numHits = 0;
+
+	indexS[0] = 0;
+	alphaS[0] = 0;
+	positionStack[cpu][0] = len-1;
+	fwdScoreS[0] = 0.0;
+	rvScoreS[0] = 0.0;
+	int stackPosition = 0;
+
+	while (stackPosition > -1) {
+		int alphaPos = alphaS[stackPosition];
+		if (alphaPos >= alphaSize) {
+			if (removeFlag == MOTIF_REMOVE_OLIGOS) {
+				int numEmpty = 0;
+				for (int i=0;i<alphaSize;i++) {
+					if (tree[indexS[stackPosition]+i] == 0) numEmpty++;
+				}
+				if (numEmpty == alphaSize && stackPosition > 0) {
+					clearTreeSlot(indexS[stackPosition-1]+alphaS[stackPosition-1]);
+				}
+			}
+			stackPosition--;
+			continue;
+		}
+		int fwdPosition = stackPosition;
+		int rvPosition = len-fwdPosition-1;
+		double fwdScore = fwdScoreS[stackPosition] + fwdT[fwdPosition*4+alphaPos];
+		double rvScore = rvScoreS[stackPosition] + rvT[fwdPosition*4+alphaPos];
+
+		if (fwdPosition < len-1) {
+			if (fwdScore+fwdMax[fwdPosition+1] < minimumScore) {
+				if (!rvFlag || rvScore+rvMax[rvPosition-1] < minimumScore) {
+					alphaS[stackPosition]++;
+					continue;
+				}
+			}
+		}
+
+		int valIndex = tree[indexS[stackPosition]+alphaPos];
+		if (valIndex < 0) {
+			const OligoRecord& r = recs[-valIndex];
+			uint64_t code = r.code;
+			for (int i=fwdPosition+1;i<len;i++) {
+				int b = (int)((code >> (2*i)) & 3);
+				fwdScore += fwdT[i*4+b];
+				rvScore += rvT[i*4+b];
+			}
+			double bestScore = fwdScore;
+			char direction = 0;
+			if (fwdScore < rvScore && rvFlag) {
+				bestScore = rvScore;
+				direction = 1;
+			}
+			Oligo* oligo = r.oligo;
+			oligo->cpuData[cpu] = bestScore;
+			oligo->value = bestScore;
+			oligo->flag = direction;
+			if (removeFlag == MOTIF_REMOVE_OLIGOS) {
+				if (bestScore >= motif->threshold) {
+					clearTreeSlot(indexS[stackPosition]+alphaPos);
+				}
+			}
+			hits[numHits++] = oligo;
+			alphaS[stackPosition]++;
+		} else if (valIndex == 0) {
+			alphaS[stackPosition]++;
+		} else {
+			alphaS[stackPosition+1] = 0;
+			indexS[stackPosition+1] = valIndex;
+			fwdScoreS[stackPosition+1] = fwdScore;
+			rvScoreS[stackPosition+1] = rvScore;
+			alphaS[stackPosition]++;
+			stackPosition++;
+		}
+	}
+	numUtilityOligos[cpu] = numHits;
+}
+
+// scoreOligosAtCut with records, read as scoreOligosWithMotifRecords reads them.
+int OligoArray::scoreOligosAtCutRecords(Motif* motif, double pruneAt, double cut, int cpu,
+				KeyedOligo* &hits, int &maxHits) {
+
+	const int len = oligoLength;
+	double fwdT[4*32];
+	double rvT[4*32];
+	fillWalkTables(motif->m,len,fwdT,rvT);
+	const double* fwdMax = motif->fwdMaxPossible;
+	const double* rvMax = motif->rvMaxPossible;
+	const OligoRecord* recs = records;
+
+	int* indexS = indexStack[cpu];
+	int* alphaS = alphaStack[cpu];
+	double* fwdScoreS = fwdScoreStack[cpu];
+	double* rvScoreS = rvScoreStack[cpu];
+	KeyedOligo* out = hits;
+	int capacity = maxHits;
+	int numHits = 0;
+
+	indexS[0] = 0;
+	alphaS[0] = 0;
+	fwdScoreS[0] = 0.0;
+	rvScoreS[0] = 0.0;
+	int stackPosition = 0;
+
+	while (stackPosition > -1) {
+		int alphaPos = alphaS[stackPosition];
+		if (alphaPos >= alphaSize) {
+			stackPosition--;
+			continue;
+		}
+		int fwdPosition = stackPosition;
+		int rvPosition = len-fwdPosition-1;
+		double fwdScore = fwdScoreS[stackPosition] + fwdT[fwdPosition*4+alphaPos];
+		double rvScore = 0.0;
+		if (rvFlag) rvScore = rvScoreS[stackPosition] + rvT[fwdPosition*4+alphaPos];
+
+		if (fwdPosition < len-1) {
+			if (fwdScore+fwdMax[fwdPosition+1] < pruneAt) {
+				if (!rvFlag || rvScore+rvMax[rvPosition-1] < pruneAt) {
+					alphaS[stackPosition]++;
+					continue;
+				}
+			}
+		}
+
+		int valIndex = tree[indexS[stackPosition]+alphaPos];
+		if (valIndex < 0) {
+			const OligoRecord& r = recs[-valIndex];
+			uint64_t code = r.code;
+			for (int i=fwdPosition+1;i<len;i++) {
+				int b = (int)((code >> (2*i)) & 3);
+				fwdScore += fwdT[i*4+b];
+				if (rvFlag) rvScore += rvT[i*4+b];
+			}
+			double bestScore = fwdScore;
+			if (fwdScore < rvScore && rvFlag) bestScore = rvScore;
+			if (bestScore >= cut) {
+				if (numHits == capacity) {
+					int newCapacity = capacity < 4096 ? 4096 : 2*capacity;
+					KeyedOligo* grown = new KeyedOligo[newCapacity];
+					for (int i=0;i<numHits;i++) grown[i] = out[i];
+					if (out != NULL) delete []out;
+					out = grown;
+					capacity = newCapacity;
+					hits = out;
+					maxHits = capacity;
+				}
+				out[numHits].key = bestScore;
+				out[numHits].oligo = r.oligo;
+				numHits++;
+			}
+			alphaS[stackPosition]++;
+		} else if (valIndex == 0) {
+			alphaS[stackPosition]++;
+		} else {
+			alphaS[stackPosition+1] = 0;
+			indexS[stackPosition+1] = valIndex;
+			fwdScoreS[stackPosition+1] = fwdScore;
+			rvScoreS[stackPosition+1] = rvScore;
+			alphaS[stackPosition]++;
+			stackPosition++;
+		}
+	}
+	return numHits;
+}
+
+// scoreOligosWithMotif's MOTIF_SCORE_OLIGOS walk with pruning bound pruneAt, keeping only the
+// leaves whose score (the larger strand's) is >= cut, in trie order, as (score, oligo) pairs in
+// hits (grown as needed). Writes nothing to the oligos. Returns the number kept.
+int OligoArray::scoreOligosAtCut(Motif* motif, double pruneAt, double cut, int cpu,
+				KeyedOligo* &hits, int &maxHits) {
+
+	motif->logxform();
+	if (records != NULL && motif->length == oligoLength) {
+		return scoreOligosAtCutRecords(motif,pruneAt,cut,cpu,hits,maxHits);
+	}
+
+	int* indexS = indexStack[cpu];
+	int* alphaS = alphaStack[cpu];
+	double* fwdScoreS = fwdScoreStack[cpu];
+	double* rvScoreS = rvScoreStack[cpu];
+	double** m = motif->m;
+	const double* fwdMax = motif->fwdMaxPossible;
+	const double* rvMax = motif->rvMaxPossible;
+	const int len = oligoLength;
+	KeyedOligo* out = hits;
+	int capacity = maxHits;
+	int numHits = 0;
+
+	indexS[0] = 0;
+	alphaS[0] = 0;
+	fwdScoreS[0] = 0.0;
+	rvScoreS[0] = 0.0;
+	int stackPosition = 0;
+
+	while (stackPosition > -1) {
+		int alphaPos = alphaS[stackPosition];
+		if (alphaPos >= alphaSize) {
+			stackPosition--;
+			continue;
+		}
+		int fwdPosition = stackPosition;
+		int rvPosition = len-fwdPosition-1;
+		double fwdScore = fwdScoreS[stackPosition] + m[fwdPosition][alphaPos];
+		double rvScore = 0.0;
+		if (rvFlag) rvScore = rvScoreS[stackPosition] + m[rvPosition][3-alphaPos];
+
+		if (fwdPosition < len-1) {
+			if (fwdScore+fwdMax[fwdPosition+1] < pruneAt) {
+				if (!rvFlag || rvScore+rvMax[rvPosition-1] < pruneAt) {
+					alphaS[stackPosition]++;
+					continue;
+				}
+			}
+		}
+
+		int valIndex = tree[indexS[stackPosition]+alphaPos];
+		if (valIndex < 0) {
+			Oligo* oligo = staticOligos[-valIndex];
+			if (fwdPosition+1 < len) {
+				const char* seq = oligo->seq;
+				for (int i=fwdPosition+1;i<len;i++) {
+					int bp = (int)alphaIndex[(int)seq[i]];
+					fwdScore += m[i][bp];
+					if (rvFlag) rvScore += m[len-i-1][3-bp];
+				}
+			}
+			double bestScore = fwdScore;
+			if (fwdScore < rvScore && rvFlag) bestScore = rvScore;
+			if (bestScore >= cut) {
+				if (numHits == capacity) {
+					int newCapacity = capacity < 4096 ? 4096 : 2*capacity;
+					KeyedOligo* grown = new KeyedOligo[newCapacity];
+					for (int i=0;i<numHits;i++) grown[i] = out[i];
+					if (out != NULL) delete []out;
+					out = grown;
+					capacity = newCapacity;
+					hits = out;
+					maxHits = capacity;
+				}
+				out[numHits].key = bestScore;
+				out[numHits].oligo = oligo;
+				numHits++;
+			}
+			alphaS[stackPosition]++;
+		} else if (valIndex == 0) {
+			alphaS[stackPosition]++;
+		} else {
+			alphaS[stackPosition+1] = 0;
+			indexS[stackPosition+1] = valIndex;
+			fwdScoreS[stackPosition+1] = fwdScore;
+			rvScoreS[stackPosition+1] = rvScore;
+			alphaS[stackPosition]++;
+			stackPosition++;
+		}
+	}
+	return numHits;
+}
+
+namespace {
+// A node of the oligo tree for scoreOligosAtCutTagged's threads to walk, or (node 0) a kept leaf
+// found above the split depth.
+struct CutTask {
+	int node;
+	int depth;
+	double fwd;
+	double rv;
+	KeyedOligo leaf;
+};
+// scoreOligosAtCutRecords' walk below node (at depth d0, path sums fwd0 and rv0), visiting the same
+// slots in the same order with the same sums. A leaf scoring >= cut is appended to out as (score,
+// oligo pointer with bit 0 set when the reverse strand scored higher); nothing is written to the
+// oligos. With tasks != NULL, such a leaf above depth split, and a node about to be entered at depth
+// split, are appended to tasks instead.
+static void walkCutRecords(const OligoArray* oa, const double* fwdT, const double* rvT,
+			const double* fwdMax, const double* rvMax, double pruneAt, double cut,
+			int d0, int node, double fwd0, double rv0, int split, std::vector<CutTask>* tasks,
+			std::vector<KeyedOligo>* out, int* indexS, int* alphaS, double* fwdScoreS, double* rvScoreS) {
+	const int len = oa->oligoLength;
+	const int alphaSize = oa->alphaSize;
+	const int rvFlag = oa->rvFlag;
+	const int* tree = oa->tree;
+	const OligoRecord* recs = oa->records;
+
+	indexS[d0] = node;
+	alphaS[d0] = 0;
+	fwdScoreS[d0] = fwd0;
+	rvScoreS[d0] = rv0;
+	int stackPosition = d0;
+
+	while (stackPosition >= d0) {
+		int alphaPos = alphaS[stackPosition];
+		if (alphaPos >= alphaSize) {
+			stackPosition--;
+			continue;
+		}
+		int fwdPosition = stackPosition;
+		int rvPosition = len-fwdPosition-1;
+		double fwdScore = fwdScoreS[stackPosition] + fwdT[fwdPosition*4+alphaPos];
+		double rvScore = 0.0;
+		if (rvFlag) rvScore = rvScoreS[stackPosition] + rvT[fwdPosition*4+alphaPos];
+
+		if (fwdPosition < len-1) {
+			if (fwdScore+fwdMax[fwdPosition+1] < pruneAt) {
+				if (!rvFlag || rvScore+rvMax[rvPosition-1] < pruneAt) {
+					alphaS[stackPosition]++;
+					continue;
+				}
+			}
+		}
+
+		int valIndex = tree[indexS[stackPosition]+alphaPos];
+		if (valIndex < 0) {
+			const OligoRecord& r = recs[-valIndex];
+			uint64_t code = r.code;
+			for (int i=fwdPosition+1;i<len;i++) {
+				int b = (int)((code >> (2*i)) & 3);
+				fwdScore += fwdT[i*4+b];
+				if (rvFlag) rvScore += rvT[i*4+b];
+			}
+			double bestScore = fwdScore;
+			uintptr_t direction = 0;
+			if (fwdScore < rvScore && rvFlag) {
+				bestScore = rvScore;
+				direction = 1;
+			}
+			if (bestScore >= cut) {
+				KeyedOligo hit;
+				hit.key = bestScore;
+				hit.oligo = (Oligo*)((uintptr_t)r.oligo | direction);
+				if (tasks != NULL) {
+					CutTask task;
+					task.node = 0;
+					task.depth = fwdPosition;
+					task.fwd = 0.0;
+					task.rv = 0.0;
+					task.leaf = hit;
+					tasks->push_back(task);
+				} else {
+					out->push_back(hit);
+				}
+			}
+			alphaS[stackPosition]++;
+		} else if (valIndex == 0) {
+			alphaS[stackPosition]++;
+		} else if (tasks != NULL && stackPosition+1 == split) {
+			CutTask task;
+			task.node = valIndex;
+			task.depth = split;
+			task.fwd = fwdScore;
+			task.rv = rvScore;
+			task.leaf.key = 0.0;
+			task.leaf.oligo = NULL;
+			tasks->push_back(task);
+			alphaS[stackPosition]++;
+		} else {
+			alphaS[stackPosition+1] = 0;
+			indexS[stackPosition+1] = valIndex;
+			fwdScoreS[stackPosition+1] = fwdScore;
+			rvScoreS[stackPosition+1] = rvScore;
+			alphaS[stackPosition]++;
+			stackPosition++;
+		}
+	}
+}
+}
+
+// scoreOligosAtCutRecords' result (the leaves scoring >= cut with pruning bound pruneAt, in trie
+// order, in hits, grown as needed), with bit 0 of each oligo pointer set when the reverse strand
+// scored higher (the flag scoreOligosWithMotif stores; Oligo is at least 8-byte aligned). On up to
+// numCPUs threads, the tree cut into nodes as scoreSortUtilityOligos cuts it, the lists joined in
+// tree order. For DeNovoMotifs' base call, which runs while no other thread uses the oligos.
+// Returns the number kept, or -1 without records.
+int OligoArray::scoreOligosAtCutTagged(Motif* motif, double pruneAt, double cut, KeyedOligo* &hits, int &maxHits) {
+	motif->logxform();
+	if (records == NULL || motif->length != oligoLength || alphaSize != 4 || oligoLength > 32) return -1;
+	const int len = oligoLength;
+	double fwdT[4*32];
+	double rvT[4*32];
+	fillWalkTables(motif->m,len,fwdT,rvT);
+	const double* fwdMax = motif->fwdMaxPossible;
+	const double* rvMax = motif->rvMaxPossible;
+
+	int T = numCPUs;
+	if (T > WINDOW_MAX_THREADS) T = WINDOW_MAX_THREADS;
+	int split = BASE_SCORE_SPLIT_DEPTH;
+	std::vector<CutTask> tasks;
+	std::vector<std::vector<KeyedOligo> > outs;
+	if (T < 2 || numOligos < BASE_SCORE_MIN_OLIGOS || len <= split) {
+		outs.resize(1);
+		std::vector<int> iS(len+1), aS(len+1);
+		std::vector<double> fS(len+1), rS(len+1);
+		walkCutRecords(this,fwdT,rvT,fwdMax,rvMax,pruneAt,cut,0,0,0.0,0.0,0,NULL,&outs[0],
+						iS.data(),aS.data(),fS.data(),rS.data());
+	} else {
+		{
+			std::vector<int> iS(len+1), aS(len+1);
+			std::vector<double> fS(len+1), rS(len+1);
+			walkCutRecords(this,fwdT,rvT,fwdMax,rvMax,pruneAt,cut,0,0,0.0,0.0,split,&tasks,NULL,
+							iS.data(),aS.data(),fS.data(),rS.data());
+		}
+		int numTasks = (int)tasks.size();
+		outs.resize(numTasks);
+		std::atomic<int> nextTask(0);
+		auto walkTasks = [&](int t) {
+			(void)t;
+			std::vector<int> iS(len+1), aS(len+1);
+			std::vector<double> fS(len+1), rS(len+1);
+			for (;;) {
+				int k = nextTask.fetch_add(1);
+				if (k >= numTasks) break;
+				const CutTask& task = tasks[k];
+				if (task.node == 0) {
+					outs[k].push_back(task.leaf);
+				} else {
+					walkCutRecords(this,fwdT,rvT,fwdMax,rvMax,pruneAt,cut,task.depth,task.node,task.fwd,
+							task.rv,0,NULL,&outs[k],iS.data(),aS.data(),fS.data(),rS.data());
+				}
+			}
+		};
+		runWindowThreads(T, walkTasks);
+	}
+	int64_t total = 0;
+	for (size_t k=0;k<outs.size();k++) total += (int64_t)outs[k].size();
+	int numHits = (int)total;
+	if (numHits > maxHits) {
+		if (hits != NULL) delete []hits;
+		hits = new KeyedOligo[numHits];
+		maxHits = numHits;
+	}
+	int at = 0;
+	for (size_t k=0;k<outs.size();k++) {
+		for (size_t i=0;i<outs[k].size();i++) hits[at++] = outs[k][i];
+	}
+	return numHits;
 }
 
 void OligoArray::calculateFoldEnrichment(double pseudoCount) {
@@ -2494,6 +5183,7 @@ double OligoArray::normalizeOligosIteration(int nlen,char* normFile, int printFl
 			double score = (double)(newScore*scoreUnit);
 
 			staticOligos[i]->numBackground = score;
+			if (records != NULL) records[i].numBackground = score;
 			staticOligos[i]->normWeight *= newScore;
 			totalBackground += staticOligos[i]->numBackground;
 		}
@@ -3331,8 +6021,6 @@ int SequenceStats::scoreCmp(const void *a, const void *b) {
 
 // ----------------------- class Oligo ------------------------------
 
-int Oligo::cpu = 0;
-
 Oligo::Oligo() {
 	init();
 }
@@ -3343,6 +6031,8 @@ void Oligo::init() {
 	value = 0.0;
 	flag = 0;
 	flag2 = 0;
+	changed = 0;
+	screenSlot = -1;
 	cpuData = NULL;
 	normWeight = 1;
 }
@@ -3373,13 +6063,6 @@ int Oligo::oligoCmp(const void *a, const void *b) {
 int Oligo::oligoCmpReverse(const void *a, const void *b) {
 	double va=(*((Oligo**)a))->value;
 	double vb=(*((Oligo**)b))->value;
-	if (va < vb) return 1;
-	if (va > vb) return -1;
-	return 0;
-}
-int Oligo::oligoCmpReverseParallel(const void *a, const void *b) {
-	double va=(*((Oligo**)a))->cpuData[cpu];
-	double vb=(*((Oligo**)b))->cpuData[cpu];
 	if (va < vb) return 1;
 	if (va > vb) return -1;
 	return 0;
@@ -5766,9 +8449,20 @@ SequenceArray::SequenceArray() {
 	objBlocks = NULL;
 	objCounts = NULL;
 	numObjBlocks = 0;
+	keptMotif = NULL;
+	keptStrand = 0;
+	keptNumSeqs = 0;
+	keptLength = 0;
+	keptMargin = 0.0;
+	keptBest = NULL;
+	keptBestSize = 0;
+	keptFwd = NULL;
+	keptFwdSize = 0;
 }
 SequenceArray::~SequenceArray() {
 	//if (link != NULL) delete link;
+	delete []keptBest;
+	delete []keptFwd;
 	delete []chunks;
 	delete []chunks6;
 	delete []count6;
@@ -5814,6 +8508,7 @@ void SequenceArray::addSequence(Sequence* s) {
 	//fprintf(stderr, "%s\t%d\n", s->name, numSeqs);
 }
 void SequenceArray::optimizeArray() {
+	keptMotif = NULL;
 	seqs = new Sequence*[numSeqs];
 	//fprintf(stderr, "numSeqs(optimize)=%d\n", numSeqs);
 	numSeqs=0;
@@ -6807,6 +9502,32 @@ void SequenceArray::maskMotifFromOligoArray(Motif* motif, OligoArray* oligos, ch
 	int offset = 0;
 	MotifScanTables tables;
 	tables.build(motif);
+	// A sequence has no site, so nothing to adjust or mask, when its
+	// best window in optimizeMotifThreshold's scan of this motif plus slack is
+	// below the threshold. The slack covers how far any window's score can
+	// have moved since: per position the largest change of a log-odds entry
+	// (getConsensus' expxform and logxform round-trip the matrix), plus the
+	// rounding margin. Only this loop edits a sequence between the two scans,
+	// and it masks only a sequence it has passed.
+	int useKept = keptMotif == motif && keptStrand == strand && keptNumSeqs == numSeqs
+					&& keptLength == mlen && keptBest != NULL && keptFwd != NULL;
+	double slack = 0.0;
+	for (int j=0;j<mlen && useKept;j++) {
+		double big = 0.0;
+		for (int k=0;k<5;k++) {
+			double a = keptFwd[j*5+k];
+			double b = tables.fwd[j*5+k];
+			if (a == b) continue;
+			if (!(std::isfinite(a) && std::isfinite(b))) {
+				useKept = 0;
+				break;
+			}
+			if (fabs(a-b) > big) big = fabs(a-b);
+		}
+		slack += big;
+	}
+	slack += (keptMargin > tables.margin) ? keptMargin : tables.margin;
+	keptMotif = NULL;
 	double totalTsites = 0;
 	double totalBsites = 0;
 	pthread_mutex_t notused;
@@ -6814,6 +9535,12 @@ void SequenceArray::maskMotifFromOligoArray(Motif* motif, OligoArray* oligos, ch
 	pthread_mutex_unlock(&notused);
 	for (int i=0;i<numSeqs;i++) {
 
+		if (useKept && keptBest[i] + slack < motif->threshold) {
+			motif->seqStats[i].seq = seqs[i];
+			motif->seqStats[i].score = keptBest[i];
+			motif->seqStats[i].setSites(sitePositions, siteStrands, 0);
+			continue;
+		}
 		int nsites = seqs[i]->motifScan(motif,strand,offset,KNOWN_FIND_ALL,score,
 								sitePositions,siteStrands,NULL,notused,&tables);
 		motif->seqStats[i].seq = seqs[i];
@@ -6911,16 +9638,34 @@ void SequenceArray::optimizeMotifThreshold(Motif* m, char strand) {
 	pthread_mutex_t notused;
 	pthread_mutex_init(&notused,NULL);
 	pthread_mutex_unlock(&notused);
+	if (keptBestSize < numSeqs) {
+		delete []keptBest;
+		keptBestSize = numSeqs;
+		keptBest = new double[keptBestSize];
+	}
 	for (int i=0;i<numSeqs;i++) {
 		double score = 0;
 		//int nsites = 0;
 		(void)seqs[i]->motifScan(m,strand,offset,mode,score,sitePositions,
 											siteStrands,NULL,notused,&tables);
+		keptBest[i] = score;
 		if (mode == KNOWN_OPTIMIZE_THREASHOLD || mode==KNOWN_FIND_ALL) {
 			m->seqStats[i].seq = seqs[i];
 			m->seqStats[i].score = score;
 		}
 	}
+	// optimizeThreshold sorts seqStats; keptBest stays in sequence order
+	if (keptFwdSize < m->length*5) {
+		delete []keptFwd;
+		keptFwdSize = m->length*5;
+		keptFwd = new double[keptFwdSize];
+	}
+	for (int k=0;k<m->length*5;k++) keptFwd[k] = tables.fwd[k];
+	keptMotif = m;
+	keptStrand = strand;
+	keptNumSeqs = numSeqs;
+	keptLength = m->length;
+	keptMargin = tables.margin;
 	m->optimizeThreshold(scorer,maxBackgroundPercent);
 	delete []sitePositions;
 	delete []siteStrands;

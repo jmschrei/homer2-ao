@@ -18,6 +18,7 @@
 #include "Hashtable.h"
 #include "statistics.h"
 #include <limits.h>
+#include <stdint.h>
 #include <math.h>
 #include <float.h>
 #include <time.h>
@@ -105,6 +106,13 @@
 
 #define DOUBLE_EPS 1e-20
 #define FLOAT_EPS 1e-10
+#define TRIAL_CUT_SLACK 0.2
+#define TRIAL_CUT_ESCALATE 0.5
+// DeNovoMotifs::optimizeBaseThresholdAtCut cuts this fraction of the motif's score range below
+// where optimizeMotifMatrix's loop can first stop.
+#ifndef BASE_CUT_SLACK
+#define BASE_CUT_SLACK 0.02
+#endif
 
 #define MAX_STAT_CACHE_SIZE 500
 
@@ -124,6 +132,31 @@ struct ThreadArgs_findMisMatchEnrichmentThread;
 struct ThreadArgs_optimizeMotifThresholdThread;
 struct ThreadArgs_scanMotifThread;
 class SequenceStats;
+
+// One oligo's leaf-test data: the sequence as a 2-bit code (base i at bits
+// 2i, A=0 C=1 G=2 T=3), its counts (kept equal to the Oligo's) and the Oligo.
+struct OligoRecord {
+	uint64_t code;
+	double numTarget;
+	double numBackground;
+	Oligo* oligo;
+};
+
+// An oligo and its sort key, for sorting by key without reading the Oligo.
+struct KeyedOligo {
+	double key;
+	Oligo* oligo;
+};
+
+// A trial thread's state for DeNovoMotifs::optimizeMotifThresholdAtCut: the fraction of the next
+// matrix's score range above minimumScore at which to cut, and its hit buffer. Padded so CPUs
+// do not share a cache line.
+struct TrialCut {
+	double frac;
+	KeyedOligo* hits;
+	int maxHits;
+	char pad[64];
+};
 
 class OligoArray {
 public:
@@ -153,8 +186,6 @@ public:
 	int rvFlag;
 	int maxAutoNormIters;
 
-	pthread_mutex_t sortMutex;
-
 	//stack variables for "recursive" looping - save's on new and delete time to keep them here
 
 	int numCPUs;
@@ -171,7 +202,63 @@ public:
 	int** rvMisMatchStack;
 	double** fwdScoreStack;
 	double** rvScoreStack;
-	
+	// One allocation holding every CPU's stacks, each CPU's on its own cache lines.
+	char* stackBlock;
+
+	// With trackChanges set, adjustOligoInstances lists every oligo whose
+	// counts it changes or that it removes from the tree, and clearTreeSlot
+	// every oligo a clear unlinks.
+	int trackChanges;
+	Oligo** changedOligos;
+	int numChangedOligos;
+	int maxChangedOligos;
+	// With snapContributions also set, changedSnap[2i] and [2i+1] hold the
+	// listed oligo's contribution to the screen's sums (oligoContribution)
+	// before its first change; NaN when it could not be computed.
+	int snapContributions;
+	double* changedSnap;
+	// From scanCountSums on: countsUsable while every count is finite and
+	// >= 0; countsExactT/Bg while that channel's counts are integers whose
+	// total (countsTotalT/Bg, an upper bound) is below 2^52, so its sums are
+	// exact in any order. adjustOligoInstances keeps them; they only clear.
+	int countsUsable;
+	int countsExactT;
+	int countsExactBg;
+	double countsTotalT;
+	double countsTotalBg;
+
+	// Built by optimizeMemoryUsage for DNA oligos of at most 32 bases, indexed
+	// by oligo number; NULL otherwise, and searches compare the strings.
+	OligoRecord* records;
+	char* recordBlock;
+	// remainMask[d]: the low bit of every 2-bit field after position d.
+	uint64_t* remainMask;
+	// firstHit[cpu][0]: oligo number of the last search's first hit.
+	int** firstHit;
+
+	// For the mismatch screen (records, -len 1-12): codeTable[k] is the number
+	// of the oligo reachable in the tree whose sequence has lexicographic
+	// 2-bit code k (base 0 in the top bits), else 0; codePresent has bit k set
+	// for the same codes. clearTreeSlot keeps both equal to the tree.
+	// codeTableState: 0 not built, 1 built, -1 not usable (the tree is searched).
+	int* codeTable;
+	uint64_t* codePresent;
+	int codeTableState;
+	// Per-CPU scratch for sumMisMatchCounts, 6 lists of codeScratchSize codes each.
+	char* codeScratchBlock;
+	uint32_t** codeScratch;
+	int codeScratchSize;
+	int codeScratchCPUs;
+	// For the first screen (buildBallSums): per lexicographic code k,
+	// ballLevels+1 (target, background) pairs: level 0 the counts of the oligo
+	// with code k (0 if none), level r their sums over every code within r
+	// mismatches of k. NULL when not built.
+	double* ballCells;
+	int ballLevels;
+	// Per level, the relative bound on |HOMER v5.1's sum - ballSums' sum|; 0 for a
+	// channel whose counts are integers with a total below 2^52 (exact sums).
+	double ballErrT[3];
+	double ballErrBg[3];
 
 
 	OligoArray();
@@ -181,6 +268,8 @@ public:
 	void optimizeMemoryUsage();
 	void printOligo(char* seq, FILE* fp);
 	int addOligo(char* seq, double vt, double vbg, double addValue); //addValue = -1 for normal add
+	int addSequenceWindows(const char* text, int numSeqs, const uint32_t* seqStart, const int* seqLen,
+				const uint64_t* goodStart, const double* pv, const double* nv, int numThreads);
 	int searchOligo(char* seq, int maxMisMatches, double& vt, double& vbg,int removeFlag,int cpu);
 	void sortActiveOligos();
 	void sortUtilityOligos(int cpu);
@@ -189,13 +278,37 @@ public:
 	void normalizeOligos(int nlen, char* normFile);
 	double normalizeOligosIteration(int nlen, char* normFile,int printFlag);
 	void scoreOligosWithMotif(Motif* motif,double minimumScore, int removeFlag,int cpu);
+	void scoreSortUtilityOligos(Motif* motif, double minimumScore, int cpu);
+	int scoreOligosAtCut(Motif* motif, double pruneAt, double cut, int cpu, KeyedOligo* &hits, int &maxHits);
+	void scoreOligosWithMotifRecords(Motif* motif,double minimumScore, int removeFlag,int cpu);
+	int scoreOligosAtCutRecords(Motif* motif, double pruneAt, double cut, int cpu, KeyedOligo* &hits, int &maxHits);
+	int scoreOligosAtCutTagged(Motif* motif, double pruneAt, double cut, KeyedOligo* &hits, int &maxHits);
 	void calculateFoldEnrichment(double pseudoCount);
 	void adjustOligoInstances(char* oligoSeq, double targetValue, double backgroundValue);
+	void recordChangedOligo(Oligo* oligo);
+	void clearChangedOligos();
+	int oligoContribution(Oligo* oligo, double& vt, double& vbg);
+	void scanCountSums();
 	void readOligoCountFile(char* file, int strand, int cpus);
+	void buildRecords();
+	void dropRecords();
+	int prepareCodeTable(int maxMisMatches);
+	void dropCodeTable();
+	void clearTreeSlot(int slot);
+	void sumMisMatchCounts(char* seq, int maxMisMatches, double& vt, double& vbg, int cpu);
+	int findExactOligo(char* seq, int cpu);
+	int ballSumsWorthBuilding(int maxMisMatches, int fromMisMatches, long long numQueries);
+	int buildBallSums(int maxMisMatches, int numThreads);
+	void dropBallSums();
+	int ballSums(const char* seq, int misMatches, double minCounts, double& vt, double& vbg, int& above);
 
 private:
 	int addOligoTree(char* seq, double vt, double vbg, double addvalue,int rvMode, int knownID);
 	int searchOligoTree(char* seq,int maxMisMatches, double& vt, double& vbg);
+	void buildCodeTable();
+	void unsetCode(int oligoIndex);
+	void dropTreeLeaf(int oligoIndex);
+	void dropLeavesBelow(int node);
 
 };
 
@@ -211,6 +324,8 @@ public:
 					// pvalue during findMisMatchEnrichment
 	char flag; //flag used to make sure we don't doulbe count oligos when traversing tree
 	char flag2; //generic flag - used to mark oligos to skip during mismatch analysis
+	char changed; // set while OligoArray::trackChanges records this oligo's counts changing
+	int screenSlot; // index of this oligo's saved mismatch screen result (DeNovoMotifs::saveScreenResults)
 	double* cpuData;
 	Oligo();
 	Oligo(char* seq);
@@ -219,8 +334,6 @@ public:
 	void print(FILE*);
 	static int oligoCmp(const void* a, const void* b);
 	static int oligoCmpReverse(const void* a, const void* b);
-	static int cpu;
-	static int oligoCmpReverseParallel(const void* a, const void* b);
 	static void revopp(char* seq);
 };
 
@@ -438,6 +551,18 @@ public:
 	// find: nothing reads the per-sequence site stats (no -mout, no
 	// -siteReduce), so motifScan skips them
 	int seqStatsUnread;
+	// optimizeMotifThreshold's scan, for the mask scan that follows on
+	// the same motif: each sequence's best window score, the forward log-odds
+	// table and margin it scanned with; keptMotif NULL when nothing is kept
+	Motif* keptMotif;
+	int keptStrand;
+	int keptNumSeqs;
+	int keptLength;
+	double keptMargin;
+	double* keptBest;
+	int keptBestSize;
+	double* keptFwd;
+	int keptFwdSize;
 
 	SequenceArray();
 	~SequenceArray();
@@ -550,6 +675,31 @@ public:
 	int nextMeter;
 	int incMeter;
 	pthread_mutex_t mutex;
+	std::atomic<long long> screenNext; // next unclaimed screenOligos index
+	Oligo** screenOligos; // the oligos findMisMatchEnrichmentThread screens
+	int numScreenOligos;
+	int screenBallFlag; // set for the first screen: screenMisMatches may use OligoArray::buildBallSums
+	// Each active oligo's (value, flag2) after the last mismatch screen.
+	Oligo** savedScreenOligos;
+	double* savedScreenValues;
+	char* savedScreenFlag2;
+	int numSavedScreen;
+	// Per saved slot and pass j = 1..sumPasses, the mismatch sums as of the
+	// last screen: savedSums[(slot*sumPasses+j-1)*4 ..+3] = target, background,
+	// and bounds on their distance from the exact sums of the current counts,
+	// valid while bit j-1 of savedSumValid[slot] is set. savedCodes[slot] is
+	// the oligo's 2-bit code when SAVED_CODE_BIT is set. sumPasses 0: not kept.
+	double* savedSums;
+	unsigned char* savedSumValid;
+	unsigned long long* savedCodes;
+	int sumPasses;
+	int rescreenSumsFlag; // set during rescreenAfterMask's screen
+	int markKeyBlocks; // blocks per key in markRescreenOligos, 1-4; 0 picks by cost
+	// Per pass, the relative bound on HOMER v5.1's own rounding of a sum; 0 for an exact channel.
+	double sumErrT[8];
+	double sumErrBg[8];
+	// One per CPU for the trial threads' optimizeMotifThreshold; NULL outside optimizeSeeds2Motifs' full masking.
+	TrialCut* trialCuts;
 
 	double numTargets;
 	double numBackground;
@@ -613,9 +763,23 @@ public:
 
 
 	void findMisMatchEnrichment(int maxMisMatches,FILE* fp,int verboseLevel);
+	void screenMisMatches(int maxMisMatches,int verboseLevel);
+	void rescreenAfterMask(int maxMisMatches);
+	int markRescreenOligos(char* dirty, int maxMisMatches);
+	void saveScreenResults();
+	void freeScreenResults();
+	void setupStoredSums();
+	void dropStoredSums();
+	int storedSums(Oligo* o, int pass, double& vt, double& vbg, int& above);
+	void storeSums(Oligo* o, int pass, double vt, double vbg);
 	void findMisMatchEnrichmentThread(ThreadArgs_findMisMatchEnrichmentThread* threadArgs);
 	void optimizeMotifMatrix(Motif* &motif);
-	void optimizeMotifThreshold(Motif* m, int cpu);
+	void optimizeMotifThreshold(Motif* m, int cpu, int trial=0, int loopFollows=0);
+	int optimizeMotifThresholdAtCut(Motif* m, int cpu);
+	int optimizeBaseThresholdAtCut(Motif* m);
+	void setMotifThreshold(Motif* m, double bestThreshold, double bestScore, double bestTvalue, double bestBGvalue);
+	void setTrialCut(Motif* m, int cpu, int breakIndex, int numHits, double bestKey, double nextKey,
+				double bestThreshold);
 	void optimizeMotifThresholdThread(ThreadArgs_optimizeMotifThresholdThread*);
 	void initializeEnrichmentScoring();
 	double scoreEnrichmentHypergeometric(double pv, double nv);
