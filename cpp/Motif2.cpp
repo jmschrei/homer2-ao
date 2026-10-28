@@ -3827,6 +3827,7 @@ MotifScanTables::MotifScanTables() {
 	rev = NULL;
 	sel = NULL;
 	gap = NULL;
+	margin = 0.0;
 	size = 0;
 	nblocks = 0;
 	blockStart[0] = 0;
@@ -3943,6 +3944,15 @@ void MotifScanTables::build(Motif* motif, int blocks) {
 		for (int k=1;k<4;k++) if (motif->m[sel[t]][k] > best) best = motif->m[sel[t]][k];
 		restOfBest += best;
 	}
+	// a NaN in a first column or an infinite entry gives a margin that
+	// filters nothing
+	margin = 0.0;
+	for (int j=0;j<mlen;j++) {
+		double big = fabs(motif->m[j][0]);
+		for (int k=1;k<4;k++) if (fabs(motif->m[j][k]) > big) big = fabs(motif->m[j][k]);
+		margin += big;
+	}
+	margin = 1e-9*(1.0+margin);
 
 	// find's blocks: the windows of the motif with the largest summed gap,
 	// two that do not overlap (5+5 from width 10, 5+4 or 4+5 at 9, 4+4 at 8),
@@ -5382,12 +5392,14 @@ int Sequence::motifScan(Motif* motif, int strand,int offset, int mode,double &be
 	static thread_local int scratchSize = 0;
 	unsigned char* code = codes;
 	if (code == NULL || mode != KNOWN_FIND_ALL || fp == NULL) {
-		if (scratchSize < length+1) {
+		if (scratchSize < length+5) {
 			delete []scratch;
-			scratchSize = length+1;
+			scratchSize = length+5;
 			scratch = new unsigned char[scratchSize];
 		}
 		for (int i=0;i<length;i++) scratch[i] = motifScanCode[(unsigned char)s[i]];
+		// past the end, for the 5-mer codes below
+		for (int i=length;i<length+4;i++) scratch[i] = 4;
 		code = scratch;
 	}
 
@@ -5497,9 +5509,135 @@ int Sequence::motifScan(Motif* motif, int strand,int offset, int mode,double &be
 		return numSites;
 	}
 
+	// Without the threshold bound (the modes that keep the best score, and
+	// ZOOPS), every window's block bound is computed first, and only windows
+	// whose bound reaches need are summed, in the usual order. need is the
+	// threshold for ZOOPS, which reads no best score; otherwise the lower of
+	// the threshold and the score of the window with the highest bound, since
+	// a window below that can be neither a site nor the best score, nor tie it.
+	const int first = mlen-1;
+	const int nwin = length-mlen+1;
+	int nf = (nwin > 0) ? nwin : 0;
+	int nr = nf;
+	const int* fc = NULL;
+	const int* rc = NULL;
+	if (!prune && tables->nblocks > 0 && nwin > 0) {
+		static thread_local unsigned short* k5 = NULL;
+		static thread_local double* fb = NULL;
+		static thread_local double* rb = NULL;
+		static thread_local int* fcand = NULL;
+		static thread_local int* rcand = NULL;
+		static thread_local int filterSize = 0;
+		if (filterSize < length+1) {
+			delete []k5;
+			delete []fb;
+			delete []rb;
+			delete []fcand;
+			delete []rcand;
+			filterSize = length+1;
+			k5 = new unsigned short[filterSize];
+			fb = new double[filterSize];
+			rb = new double[filterSize];
+			fcand = new int[filterSize];
+			rcand = new int[filterSize];
+		}
+		// kmerCodes5's codes, each position on its own (code is the scratch
+		// copy here, padded with 4s)
+		for (int i=0;i<length;i++) {
+			k5[i] = (unsigned short)(code[i]*625 + code[i+1]*125 + code[i+2]*25 + code[i+3]*5 + code[i+4]);
+		}
+		const int doF = strand == MOTIF_STRAND_POS || strand==MOTIF_STRAND_BOTH;
+		const int doR = strand == MOTIF_STRAND_BOTH || strand==MOTIF_STRAND_NEG;
+		if (doF) {
+			const unsigned short* k0 = k5+a0;
+			const unsigned short* k1 = k5+a1;
+			for (int i=0;i<nwin;i++) fb[i] = blockRest + bf0[k0[i]] + bf1[k1[i]];
+		}
+		if (doR) {
+			// as find's fast path: the window ending at first+t
+			const unsigned short* k0 = k5+first-a0-len0+1;
+			const unsigned short* k1 = k5+first-a1-len1+1;
+			for (int t=0;t<nwin;t++) rb[t] = blockRest + br0[k0[t]] + br1[k1[t]];
+		}
+		double need = motif->threshold;
+		if (mode != KNOWN_JUST_SCORE_ZOOPS) {
+			// the highest bound (NaNs ignored), by four independent maxima, then
+			// the first window that has it
+			double tm[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
+			for (int st=0;st<2;st++) {
+				if (st == 0 ? !doF : !doR) continue;
+				const double* b = (st == 0) ? fb : rb;
+				int i = 0;
+				for (;i+4<=nwin;i+=4) {
+					for (int u=0;u<4;u++) tm[u] = (b[i+u] > tm[u]) ? b[i+u] : tm[u];
+				}
+				for (;i<nwin;i++) tm[0] = (b[i] > tm[0]) ? b[i] : tm[0];
+			}
+			double top = tm[0];
+			for (int u=1;u<4;u++) top = (tm[u] > top) ? tm[u] : top;
+			int topAt = -1;
+			int topRev = 0;
+			if (top > -INFINITY) {
+				if (doF) {
+					for (int i=0;i<nwin;i++) {
+						if (fb[i] == top) {
+							topAt = i;
+							break;
+						}
+					}
+				}
+				if (topAt < 0 && doR) {
+					for (int t=0;t<nwin;t++) {
+						if (rb[t] == top) {
+							topAt = t;
+							topRev = 1;
+							break;
+						}
+					}
+				}
+			}
+			double best = -INFINITY;
+			if (topAt >= 0) {
+				best = 0.0;
+				if (topRev) {
+					const unsigned char* c = code+first+topAt;
+					for (int j=0;j<mlen;j++) best += rev[j*5+c[-j]];
+				} else {
+					const unsigned char* c = code+topAt;
+					for (int j=0;j<mlen;j++) best += fwd[j*5+c[j]];
+				}
+			}
+			// a best that is not a finite number filters nothing
+			if (!(best > -INFINITY && best < INFINITY)) {
+				need = -INFINITY;
+			} else if (best < need) {
+				need = best;
+			}
+		}
+		need -= tables->margin;
+		if (doF) {
+			int n = 0;
+			for (int i=0;i<nwin;i++) {
+				fcand[n] = i;
+				n += !(fb[i] < need);
+			}
+			nf = n;
+			fc = fcand;
+		}
+		if (doR) {
+			int n = 0;
+			for (int t=0;t<nwin;t++) {
+				rcand[n] = first+t;
+				n += !(rb[t] < need);
+			}
+			nr = n;
+			rc = rcand;
+		}
+	}
+
 	if (strand == MOTIF_STRAND_POS || strand==MOTIF_STRAND_BOTH) {
-		int totalLength = length-(motif->length)+1;
-		for (int i=0;i<totalLength;i++) {
+		for (int ci=0;ci<nf;ci++) {
+			const int i = (fc != NULL) ? fc[ci] : ci;
 			const unsigned char* c = code+i;
 			if (prune) {
 				double bound = restOfBest;
@@ -5545,7 +5683,8 @@ int Sequence::motifScan(Motif* motif, int strand,int offset, int mode,double &be
 	}
 
 	if (strand == MOTIF_STRAND_BOTH || strand==MOTIF_STRAND_NEG) {
-		for (int i=length-1;i>=motif->length-1;i--) {
+		for (int ci=nr-1;ci>=0;ci--) {
+			const int i = (rc != NULL) ? rc[ci] : first+ci;
 			const unsigned char* c = code+i;
 			if (prune) {
 				double bound = restOfBest;
@@ -6792,7 +6931,10 @@ void SequenceArray::motifScan(Motif* m, int strand,int offset, int mode,FILE* fp
 	// find, width 6 and more, with the 6-mer index built: buildSix's blocks
 	// replace the 5-mer ones
 	int pivotP = 0;
-	if (mode == KNOWN_FIND_ALL && fp != NULL) {
+	// known's ZOOPS count: only whether a sequence has a window at the
+	// threshold matters, so the same index serves it
+	const int zoops = mode == KNOWN_JUST_SCORE_ZOOPS && fp == NULL;
+	if ((mode == KNOWN_FIND_ALL && fp != NULL) || zoops) {
 		if (chunks7 != NULL && m->length >= 7) pivotP = 7;
 		else if (chunks6 != NULL && m->length >= 6) pivotP = 6;
 	}
@@ -6872,6 +7014,45 @@ void SequenceArray::motifScan(Motif* m, int strand,int offset, int mode,FILE* fp
 			nf = resolveAts(c, 0, m->length, (unsigned int*)fkeys, nf, fseq, fpos);
 			nr = resolveAts(c, 1, m->length, (unsigned int*)rkeys, nr, rseq, rpos);
 			if (nf == 0 && nr == 0) continue;
+			if (zoops) {
+				// a sequence counts when any of its candidates scores at the
+				// threshold; summed exactly as Sequence::motifScan sums
+				const int mlen = m->length;
+				const double* fwd = tables.fwd;
+				const double* rev = tables.rev;
+				const double threshold = m->threshold;
+				int a = 0;
+				int b = 0;
+				while (a < nf || b < nr) {
+					const int qa = (a < nf) ? fseq[a] : INT_MAX;
+					const int qb = (b < nr) ? rseq[b] : INT_MAX;
+					const int q = (qa < qb) ? qa : qb;
+					const Sequence* sq = seqs[c->first+q];
+					int hit = 0;
+					for (;a<nf && fseq[a]==q;a++) {
+						if (hit) continue;
+						const unsigned char* cc = sq->codes + fpos[a];
+						double score = 0.0;
+						for (int j=0;j<mlen;j++) score += fwd[j*5+cc[j]];
+						if (score != -INFINITY && score >= threshold) hit = 1;
+					}
+					for (;b<nr && rseq[b]==q;b++) {
+						if (hit) continue;
+						const unsigned char* cc = sq->codes + rpos[b];
+						double score = 0.0;
+						for (int j=0;j<mlen;j++) score += rev[j*5+cc[-j]];
+						if (score != -INFINITY && score >= threshold) hit = 1;
+					}
+					if (hit) {
+						if (sq->g == 1) {
+							m->numTarget += sq->w;
+						} else {
+							m->numBackground += sq->w;
+						}
+					}
+				}
+				continue;
+			}
 			// the sequences with candidates, in order: (q, first forward, first reverse)
 			static thread_local std::vector<int> gq, ga, gb;
 			gq.clear();
@@ -7577,6 +7758,18 @@ void KnownMotifs::getMotifEnrichment() {
 			if (motifs[k]->length > maxWidth) maxWidth = motifs[k]->length;
 		}
 		seqArray->prepareKmers((int)numCPUs, need5, need6, maxWidth, need7);
+	} else if (threasholdOptimizationFlag == KNOWN_JUST_SCORE_ZOOPS && sitefp == NULL) {
+		// known: the 6/7-mer index finds, for motifs of width 6 and more,
+		// the sequences with a window at the threshold
+		int need6 = 0;
+		int need7 = 0;
+		int maxWidth = 0;
+		for (int k=0;k<numMotifs;k++) {
+			if (motifs[k]->length >= 7) need7 = 1;
+			else if (motifs[k]->length == 6) need6 = 1;
+			if (motifs[k]->length > maxWidth) maxWidth = motifs[k]->length;
+		}
+		if (need6 || need7) seqArray->prepareKmers((int)numCPUs, 0, need6, maxWidth, need7);
 	}
 	// The stats are printed by -mout (Motif::print) and compared by
 	// -siteReduce (scoreOverlap); plain find prints neither.
@@ -7697,8 +7890,7 @@ void KnownMotifs::scanMotifThread(ThreadArgs_scanMotifThread* args) {
 			motif->optimizeThreshold(scorer,maxBackgroundPercent);
 		} else if (threasholdOptimizationFlag == KNOWN_JUST_SCORE_ZOOPS) {
 			if (findFlag == 0 && numBackground > 0.5 && numTargets > 0.5) {
-				double logp = scorer->scoreEnrichment(motif->numTarget, motif->numBackground);
-				motif->logp = logp;
+				motif->logp = scorer->scoreEnrichment(motif->numTarget, motif->numBackground);
 			} else {
 				motif->logp = 0.0;
 			}
@@ -7796,10 +7988,26 @@ EnrichmentScorer::~EnrichmentScorer() {
 	if (bgZoopsApprox != NULL) delete []bgZoopsApprox;
 	if (cache != NULL) {
 		for (int i=0;i<cacheLength;i++) {
-			if (cache[i] != NULL) delete [](cache[i]);
+			double* row = cache[i].load(std::memory_order_relaxed);
+			if (row != NULL) delete []row;
 		}
 		delete []cache;
 	}
+}
+
+// A row is filled in private and published with a compare-and-swap; a thread
+// that loses the race frees its copy and uses the winner's.
+double* EnrichmentScorer::getCacheRow(unsigned int mtotal) {
+	double* row = cache[mtotal].load(std::memory_order_acquire);
+	if (row != NULL) return row;
+	double* fresh = new double[mtotal+1];
+	for (unsigned int i=0;i<mtotal+1;i++) fresh[i]=10.0;
+	if (cache[mtotal].compare_exchange_strong(row, fresh, std::memory_order_acq_rel,
+												std::memory_order_acquire)) {
+		return fresh;
+	}
+	delete []fresh;
+	return row;
 }
 
 double EnrichmentScorer::scoreEnrichmentHypergeometric(double pv, double nv) {
@@ -7815,15 +8023,12 @@ double EnrichmentScorer::scoreEnrichmentHypergeometric(double pv, double nv) {
 	double logp = 0.0;
 
 	if (mtotal < (unsigned int)cacheLength) {
-		if (cache[mtotal] == NULL) {
-			cache[mtotal]=new double[mtotal+1];
-			for (unsigned int i=0;i<mtotal+1;i++) cache[mtotal][i]=10.0;
-		}
-		if (cache[mtotal][targetValue] > 1.0) {
-			cache[mtotal][targetValue] = loghypergeoD((unsigned int)(numTargets+numBackground),
+		double* row = getCacheRow(mtotal);
+		if (row[targetValue] > 1.0) {
+			row[targetValue] = loghypergeoD((unsigned int)(numTargets+numBackground),
 					(unsigned int)numTargets, mtotal, targetValue);
 		}
-		logp = cache[mtotal][targetValue];
+		logp = row[targetValue];
 	} else {
 		logp = loghypergeoD((unsigned int)(numTargets+numBackground),
 				(unsigned int)numTargets, mtotal, targetValue);
@@ -7865,17 +8070,14 @@ double EnrichmentScorer::scoreEnrichmentBinomial(double pv, double nv) {
 	double ratio = ((double)bgValue)/numBackground;
 	double logp = 0.0;
 	if (mtotal < (unsigned int)cacheLength) {
-		if (cache[mtotal] == NULL) {
-			cache[mtotal]=new double[mtotal+1];
-			for (unsigned int i=0;i<mtotal+1;i++) cache[mtotal][i]=10.0;
-		}
-		if (cache[mtotal][targetValue] > 1.0) {
-			cache[mtotal][targetValue] = logbinomialD((unsigned int)(numTargets),
+		double* row = getCacheRow(mtotal);
+		if (row[targetValue] > 1.0) {
+			row[targetValue] = logbinomialD((unsigned int)(numTargets),
 						(unsigned int)targetValue, ratio, (unsigned int)numBackground);
 		} else {
 			//fprintf(stderr, ".");
 		}
-		logp = cache[mtotal][targetValue];
+		logp = row[targetValue];
 	} else {
 		logp = logbinomialD((unsigned int)(numTargets),
 						(unsigned int)targetValue, ratio, (unsigned int)numBackground);
@@ -7891,9 +8093,9 @@ void EnrichmentScorer::initializeEnrichmentScoring(int scoringMethod,double numT
 	maxCacheSize = newMaxCacheSize;
 	cacheLength = (int)sqrt((double)maxCacheSize*2.0);
 	fprintf(stderr, "\tCache length = %d\n", cacheLength);
-	cache = new double*[cacheLength];
+	cache = new std::atomic<double*>[cacheLength];
 	for (int i=0;i<cacheLength;i++) {
-		cache[i] = NULL;
+		cache[i].store(NULL, std::memory_order_relaxed);
 	}
 
 	if (scoringMethod == MOTIF_SCORING_HYPERGEOMETRIC) {

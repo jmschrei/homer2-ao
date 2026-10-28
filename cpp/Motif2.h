@@ -23,6 +23,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <atomic>
 #include <sys/time.h>
 
 #ifndef MOTIF_H
@@ -236,6 +237,9 @@ public:
 	double* rev;
 	int* sel;
 	double* gap;
+	// how far rounding may move a window's score or bound: 1e-9 of the sum
+	// of the largest magnitude at every position, plus 1e-9
+	double margin;
 	int size;
 	// find's bound: up to two blocks of 4 or 5 positions, each with a
 	// 3125-entry table of its partial log-odds per 5-mer (base 5) starting at
@@ -631,7 +635,7 @@ public:
 	unsigned int numTargets;
 	unsigned int numBackground;
 
-	double** cache;
+	std::atomic<double*>* cache;
 	int cacheLength;
 	unsigned long long int maxCacheSize;
 
@@ -652,6 +656,7 @@ public:
 	double scoreEnrichmentZscore(double pv, double nv);
 	double getZoopsApproxTarget(double value);
 	double getZoopsApproxBackground(double value);
+	double* getCacheRow(unsigned int mtotal);
 };
 
 
