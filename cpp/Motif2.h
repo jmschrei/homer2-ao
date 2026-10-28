@@ -223,6 +223,91 @@ public:
 	static void revopp(char* seq);
 };
 
+// What Sequence::motifScan needs from a motif, built once per motif: the
+// log-odds as two flattened tables (forward and reverse complement, 5 entries
+// per position, the fifth -inf for non-ACGT bases), and the pruning bound's
+// positions and the best total of the others.
+class MotifScanTables {
+public:
+	int length;
+	int K;
+	double restOfBest;
+	double* fwd;
+	double* rev;
+	int* sel;
+	double* gap;
+	int size;
+	// find's bound: up to two blocks of 4 or 5 positions, each with a
+	// 3125-entry table of its partial log-odds per 5-mer (base 5) starting at
+	// the block, forward and reverse complement, plus the best total of every
+	// position outside the blocks. A block of 4 ignores the fifth base. With
+	// one block the second table is all zeros at the same offset.
+	int nblocks;
+	int blockStart[2];
+	int blockLen[2];
+	double blockRest;
+	double* bfwd;
+	double* brev;
+	// find's index: per strand (0 forward, 1 reverse), the block whose
+	// passing 4-mers are fewest and those 4-mers; indexable is 0 when a
+	// block table holds a NaN, and find then scans every window.
+	int indexable;
+	int pivot[2];
+	int npass[2];
+	int* pass[2];
+	// find's 6-mer index, for widths 6 and more (buildSix): s6n blocks, block 0
+	// of 6 positions, block 1 of 6 (width 12+) or of the width-6 positions
+	// left (widths 7-11), plus the best total of every position outside them.
+	// A block of 6 has a 4097-entry table per strand, indexed by kmer6 (entry
+	// 4096, an N, is -inf); a shorter block a 3125-entry table per strand
+	// indexed by kmer5, the unused digits ignored. Per strand, the pivot (a
+	// block of 6) and its passing 6-mers with their partial scores.
+	// The pivot has sixP = 6 or 7 positions; blocks of 6 or 7 have a
+	// table of 4^k + 1 entries in t6 (the last, an N, -inf), read through
+	// k-mer codes of their length; shorter blocks a 3125-entry o5 table.
+	int six;
+	int sixP;
+	int s6n;
+	int s6Start[3];
+	int s6Len[3];
+	double s6Rest;
+	double* t6[2][3];
+	double* o5[2][3];
+	// with the 7-mer pivot, a block of 5 or fewer positions reads
+	// ck7's prefix code >> 4: o5x has the block's partial score of each of
+	// the 4096 slots (-inf for a prefix shorter than the block)
+	double* o5x[2][3];
+	int s6pivot[2];
+	int s6npass[2];
+	int* s6pass[2];
+	double* s6passScore[2];
+	// per passing pivot k-mer, its score less the need; a window
+	// passes the flank test when that margin plus s6flankL[st][b1 + 4*b2] of
+	// the two bases before the k-mer (b1 the nearer) plus
+	// s6flankR[st][b1 + 4*b2 + 16*b3] of the three after is at least 0
+	double* s6passGap[2];
+	double s6flankL[2][16];
+	double s6flankR[2][64];
+	// a block of k = 6 or 7's table is halfHi[st][q][x >> 2(k-3)] +
+	// halfLo[st][q][x & (4^(k-3) - 1)]; the shorter block's table repeats
+	// o5Width values o5Unused times each
+	double halfHi[2][3][64];
+	double halfLo[2][3][256];
+	int o5Width[3];
+	int o5Unused[3];
+	// per strand: each block's best partial score, and the blocks
+	// other than the pivot, the larger-gap one first
+	double s6max[2][3];
+	int s6oth[2][2];
+
+	MotifScanTables();
+	~MotifScanTables();
+	// blocks = 0 skips the 5-mer blocks and their index (find's 6-mer index
+	// replaces them)
+	void build(Motif* motif, int blocks = 1);
+	int buildSix(Motif* motif, int P, const int* countP);
+};
+
 class Sequence {
 public:
 	char* s;
@@ -231,14 +316,79 @@ public:
 	char* name;
 	int length;
 	int id;
+	// Base-5 index of the 5-mer starting at each position (N past the end),
+	// for find's block bound, and each base's table column; NULL until
+	// SequenceArray::prepareKmers().
+	unsigned short* kmer5;
+	// base-4 6-mer starting at each position; 4096 when it holds an N or
+	// runs past the end
+	unsigned short* kmer6;
+	unsigned char* codes;
+	// codes points into a chunk's block (KmerChunk::codesBlock), which
+	// the chunk frees
+	int codesShared;
+	// name and s point into a SequenceArray text block, which the
+	// array frees
+	int textShared;
 
 	Sequence();
 	Sequence(char* name, char* seq, int group, double weight);
 	~Sequence();
 	void init();
 	void setSeq(char* name, char* seq, int group, double weight);
+	// setSeq of a name and a sequence given by length, the sequence cleaned
+	// (cleanSequence) as it is copied
+	void setSeqCleaned(const char* name, size_t nameLen, const char* seq, size_t seqLen,
+			int group, double weight);
+	// setSeqCleaned with the name and then the sequence written at
+	// `at` (nameLen + seqLen + 2 bytes), which the Sequence does not own
+	void setSeqCleanedAt(const char* name, size_t nameLen, const char* seq, size_t seqLen,
+			int group, double weight, char* at);
+	// codes, and kmer5 when withKmer5 (the 5-mer index and the per-window
+	// find path read it)
+	// codes written at codesAt when it is not NULL (not owned)
+	void prepareKmers(int withKmer5 = 1, unsigned char* codesAt = NULL);
 	int motifScan(Motif* m,int strand, int offset,int mode, double &bestScore, 
-					int* sitePositions, char* siteStrands, FILE* fp, pthread_mutex_t fileLock);
+					int* sitePositions, char* siteStrands, FILE* fp, pthread_mutex_t fileLock,
+					const MotifScanTables* tables = NULL);
+	int scanCandidates(Motif* motif, int strand, int offset, double &bestScore,
+					int* sitePositions, char* siteStrands, FILE* fp,
+					const MotifScanTables* tables, const int* fwdCand, int nf,
+					const int* revCand, int nr);
+};
+// find's inverted index over consecutive sequences first..first+count-1:
+// for each base-5 4-mer value v with no N, the entries start[v]..start[v+1]-1
+// of pos (start of the 4-mer in its sequence) and sid (its sequence, minus
+// first).
+class KmerChunk {
+public:
+	int first;
+	int count;
+	int* start;
+	int* pos;
+	unsigned short* sid;
+	// 6-mer chunks: the sequences' kmer6 and kmer5 codes end to end, from
+	// cstart[q] (length clen[q]), with `pad` codes holding an N before the
+	// first and after the last; pos then indexes these arrays
+	int* cstart;
+	int* clen;
+	unsigned short* ck7;
+	unsigned short* ck6;
+	unsigned short* ck5;
+	// 6/7-mer chunks keep no sid: blockSeq[p >> 6] is the last sequence that
+	// starts at or before position p rounded down to 64 (code arrays' index)
+	unsigned short* blockSeq;
+	// pos packs the entry's flanking bases when flanks: bits 0-21 the
+	// position, 22-25 the two bases before the k-mer (b1 + 4*b2, b1 the
+	// nearer), 26-31 the three after (b1 + 4*b2 + 16*b3), 2 bits a base,
+	// an N or a base past the sequence read as A (0); otherwise pos is the
+	// position alone (a chunk of 2^22 positions or more)
+	int flanks;
+	// the codes of the chunk's sequences (base chunks only)
+	unsigned char* codesBlock;
+
+	KmerChunk();
+	~KmerChunk();
 };
 class LinkedSequence {
 public:
@@ -262,13 +412,38 @@ public:
 	EnrichmentScorer* scorer;	
 	double maxBackgroundPercent;
 	int maxAutoNormIters;
+	KmerChunk* chunks;
+	int numChunks;
+	// blocks of sequence names and texts, and of Sequence objects
+	// built in place (objBlocks[i] holds objCounts[i]); freed with free()
+	char** textBlocks;
+	int numTextBlocks;
+	Sequence** objBlocks;
+	long* objCounts;
+	int numObjBlocks;
+	// chunks holds the 5-mer index when index5; chunks6 (same first/count)
+	// the 6-mer index, with count6 its total per 6-mer
+	int index5;
+	KmerChunk* chunks6;
+	int* count6;
+	// the 7-mer index (widths 7 and more), with count7 its total per 7-mer
+	KmerChunk* chunks7;
+	int* count7;
+	// the most index entries in one 6-mer chunk
+	int maxChunk6Entries;
+	// find: nothing reads the per-sequence site stats (no -mout, no
+	// -siteReduce), so motifScan skips them
+	int seqStatsUnread;
 
 	SequenceArray();
 	~SequenceArray();
 	void deleteLinks();
 	void addSequence(Sequence* s);
+	void prepareKmers(int threads = 1, int need5 = 1, int need6 = 0, int maxWidth = 0, int need7 = 0);
+	void maskMotifs(Motif** motifs, int numMotifs, int strand, int offset, int threads);
 	void optimizeArray();
 	void readSequenceFiles(char* seqFile, char* groupFile);
+	void readFastaDirect(char* inputFASTAfile, char* bgFASTAfile, int threads = 1);
 	void printGroupFile(FILE* fp);
 	void printSequenceFile(FILE* fp);
 	void motifScan(Motif* m,int strand, int offset,int mode,FILE* fp, pthread_mutex_t fileLock);
@@ -339,6 +514,7 @@ public:
 	void setBlank(int len);
 	void addOligo(Oligo* o);
 	void initializeSeqStats(int);
+	void deleteSeqStats();
 	void optimizeThreshold(EnrichmentScorer* scorer, double maxBackPercent);
 	void adjustLength(int);
 	void calculateDistributionStats();
@@ -508,6 +684,8 @@ public:
 	char* inputFASTAfile;
 	char* bgFASTAfile;
 	int fastaFlag;
+	// -i FASTA is read in memory by loadSequence, not through temp files
+	int directFasta;
 	char* knownFile;
 	char* normFile;
 	FILE* sitefp;

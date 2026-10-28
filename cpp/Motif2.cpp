@@ -14,6 +14,21 @@
 // GNU General Public License for more details.
 
 #include "Motif2.h"
+#include <stdarg.h>
+#include <algorithm>
+#include <sys/stat.h>
+#include <cmath>
+#include <atomic>
+#include <sys/mman.h>
+#include <cerrno>
+#include <condition_variable>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 int Motif::alphaSize = DNA_ALPHA;
 char* Motif::alphaIndex = NULL;
@@ -2656,6 +2671,10 @@ void Motif::initializeSeqStats(int num) {
 		seqStats[i].initialize();
 	}
 }
+void Motif::deleteSeqStats() {
+	if (seqStats != NULL) delete []seqStats;
+	seqStats = NULL;
+}
 
 
 void Motif::setBlank(int len) {
@@ -2943,6 +2962,58 @@ int Motif::motifCmp(const void *a, const void *b) {
 	return 0;
 }
 
+// sscanf(s, "%lf", v): a field that is a plain decimal number (optional
+// sign, digits with an optional point, an optional exponent with digits,
+// nothing after) goes to strtod, which is what glibc's scanf converts such a
+// field with; anything else goes to sscanf.
+static void scanDouble(const char* s, double* v) {
+	const char* p = s;
+	if (*p == '+' || *p == '-') p++;
+	int digits = 0;
+	while (*p >= '0' && *p <= '9') {
+		p++;
+		digits++;
+	}
+	if (*p == '.') {
+		p++;
+		while (*p >= '0' && *p <= '9') {
+			p++;
+			digits++;
+		}
+	}
+	if (digits > 0 && (*p == 'e' || *p == 'E')) {
+		const char* e = p+1;
+		if (*e == '+' || *e == '-') e++;
+		int expDigits = 0;
+		while (*e >= '0' && *e <= '9') {
+			e++;
+			expDigits++;
+		}
+		if (expDigits > 0) p = e;
+		else digits = 0;
+	}
+	if (digits > 0 && *p == '\0') {
+		*v = strtod(s, NULL);
+		return;
+	}
+	sscanf(s, "%lf", v);
+}
+
+// The next line fgets(buf, MOTIF2_BUFFER, fp) would return from data[at, n):
+// at most MOTIF2_BUFFER-1 bytes, ending after the first newline.
+static int nextMotifLine(const std::vector<char>& data, size_t& at, const char*& line, size_t& len) {
+	if (at >= data.size()) return 0;
+	const size_t most = MOTIF2_BUFFER-1;
+	size_t avail = data.size()-at;
+	const char* p = data.data()+at;
+	const char* nl = (const char*)memchr(p, '\n', avail < most ? avail : most);
+	if (nl != NULL) len = nl-p+1;
+	else len = avail < most ? avail : most;
+	line = p;
+	at += len;
+	return 1;
+}
+
 Motif** Motif::readMotifFile(char* file, int &numMotifs) {
 
 	numMotifs=0;
@@ -2952,19 +3023,36 @@ Motif** Motif::readMotifFile(char* file, int &numMotifs) {
 		fprintf(stderr, "!!! Couldn't open motif file: %s !!!\n", file);
 		return NULL;
 	}
+	// the file once, in memory; both passes below read its fgets lines
+	std::vector<char> data;
+	{
+		size_t got = 0;
+		data.resize((size_t)1 << 20);
+		while (1) {
+			size_t r = fread(data.data()+got, 1, data.size()-got, fp);
+			got += r;
+			if (got < data.size()) break;
+			data.resize(data.size()*2);
+		}
+		data.resize(got);
+	}
 	char* buf = new char[MOTIF2_BUFFER];
 	char** cols = new char*[1000];
 	int numCols;
+	size_t at = 0;
+	const char* line = NULL;
+	size_t len = 0;
 
 	int maxMotifs = 0;
-	while (fgets(buf, MOTIF2_BUFFER, fp) != NULL) {
-		if (buf[0] == '>') maxMotifs++;
+	while (nextMotifLine(data, at, line, len)) {
+		if (line[0] == '>') maxMotifs++;
 	}
 
 	int maxMotifLength = MAXIMUM_MOTIF_LENGTH;
 	double** matrix = new double*[MAXIMUM_MOTIF_LENGTH];
+	double* matrixRows = new double[(size_t)MAXIMUM_MOTIF_LENGTH*DNA_ALPHA];
 	for (int i=0;i<maxMotifLength;i++) {
-		matrix[i] = new double[DNA_ALPHA];
+		matrix[i] = matrixRows + (size_t)i*DNA_ALPHA;
 	}
 
 	char* consensus = new char[MAXIMUM_MOTIF_LENGTH];
@@ -2978,8 +3066,25 @@ Motif** Motif::readMotifFile(char* file, int &numMotifs) {
 
 	Motif** motifs = new Motif*[maxMotifs];
 
-	rewind(fp);
-	while (fgets(buf, MOTIF2_BUFFER, fp) != NULL) {
+	// The second pass reads the file again from its start. A stream that
+	// cannot seek (a pipe) gives it only what arrives after the first pass's
+	// end of file, as rewind() + fgets() would.
+	if (fseek(fp, 0, SEEK_SET) != 0) {
+		clearerr(fp);
+		size_t got = 0;
+		data.resize((size_t)1 << 20);
+		while (1) {
+			size_t r = fread(data.data()+got, 1, data.size()-got, fp);
+			got += r;
+			if (got < data.size()) break;
+			data.resize(data.size()*2);
+		}
+		data.resize(got);
+	}
+	at = 0;
+	while (nextMotifLine(data, at, line, len)) {
+		memcpy(buf, line, len);
+		buf[len] = '\0';
 		splitMotif2(buf,cols,numCols,'\t');
 		if (numCols < 3) continue;
 		if (cols[0][0] == '>') {
@@ -2993,15 +3098,15 @@ Motif** Motif::readMotifFile(char* file, int &numMotifs) {
 				started=1;
 				strcpy(consensus,&(cols[0][1]));
 				strcpy(name,cols[1]);
-				sscanf(cols[2],"%lf",&threshold);
+				scanDouble(cols[2],&threshold);
 				logp = 0.0;
-				if (numCols > 3) sscanf(cols[3],"%lf",&logp);
+				if (numCols > 3) scanDouble(cols[3],&logp);
 			} else {
 				started=0;
 			}
 		} else if (numCols > 3) {
 			for (int i=0;i<DNA_ALPHA;i++) {
-				sscanf(cols[i],"%lf",&(matrix[curMotifLength][i]));
+				scanDouble(cols[i],&(matrix[curMotifLength][i]));
 			}
 			curMotifLength++;
 		}
@@ -3328,18 +3433,35 @@ Sequence::Sequence(char* n, char* seq, int group, double weight) {
 	setSeq(n,seq,group,weight);
 }
 Sequence::~Sequence() {
+	if (textShared) {
+		s = NULL;
+		name = NULL;
+	}
 	if (s != NULL) delete []s;
 	if (name != NULL) delete []name;
+	if (kmer5 != NULL) delete []kmer5;
+	if (kmer6 != NULL) delete []kmer6;
+	if (codes != NULL && !codesShared) delete []codes;
 }
 void Sequence::init() {
 	s=NULL;
 	name=NULL;
+	kmer5=NULL;
+	kmer6=NULL;
+	codes=NULL;
+	codesShared=0;
+	textShared=0;
 	length = 0;
 	w=1.0;
 	g=0;
 	id=0;
 }
 void Sequence::setSeq(char* n, char* seq, int group, double weight) {
+	if (textShared) {
+		s = NULL;
+		name = NULL;
+		textShared = 0;
+	}
 	if (name != NULL) delete []name;
 	if (n == NULL) {
 		name = NULL;
@@ -3349,6 +3471,13 @@ void Sequence::setSeq(char* n, char* seq, int group, double weight) {
 	}
 	w = weight;
 	g = group;
+	if (kmer5 != NULL) delete []kmer5;
+	kmer5 = NULL;
+	if (kmer6 != NULL) delete []kmer6;
+	kmer6 = NULL;
+	if (codes != NULL && !codesShared) delete []codes;
+	codes = NULL;
+	codesShared = 0;
 	if (s != NULL) delete []s;
 	if (seq == NULL) {
 		s = NULL;
@@ -3360,44 +3489,2030 @@ void Sequence::setSeq(char* n, char* seq, int group, double weight) {
 	}
 }
 
+// Base -> column of the flattened log-odds table: A,C,G,T = 0..3, and every
+// other character (N, IUPAC letters, lowercase) = 4, whose entry is -inf.
+static unsigned char motifScanCode[256];
+static int motifScanCodeInit() {
+	for (int i=0;i<256;i++) motifScanCode[i] = 4;
+	motifScanCode[(unsigned char)'A'] = 0;
+	motifScanCode[(unsigned char)'C'] = 1;
+	motifScanCode[(unsigned char)'G'] = 2;
+	motifScanCode[(unsigned char)'T'] = 3;
+	return 1;
+}
+static int motifScanCodeReady = motifScanCodeInit();
+
+// find and -mscore write each motif's lines in motif-file order, the order
+// HOMER v5.1's homer2 gives at -p 1, whatever -p is. Lines of the first motif in
+// file order not yet complete (the head) join the queue of lines ready to
+// write; any other motif keeps its lines until every motif before it is
+// complete. One thread at a time writes the queue, outside the lock. Threads
+// take motifs in file order, which keeps little unwritten; with more than
+// orderedCap bytes unwritten they take only the head, or wait for it.
+static const size_t orderedCap = (size_t)64 << 20;
+// Blocks smaller than this are copied; larger ones are taken over with the
+// thread's buffer, which gets a spare back.
+static const size_t orderedCopyMax = (size_t)1 << 16;
+// A thread's output buffer: allocated whole (chunkArray, released
+// with free()), flushed when it holds more than 1 MB.
+static const size_t scanOutBlock = ((size_t)1 << 20) + ((size_t)64 << 10);
+template <typename T>
+static T* chunkArray(long n);
+struct OrderedPiece {
+	char* data;
+	size_t len;
+	size_t cap;
+};
+struct OrderedOutput {
+	FILE* fp;
+	int n;
+	int fileCursor;
+	int next;
+	std::vector<char> started;
+	std::vector<char> done;
+	std::vector<std::vector<OrderedPiece> > held;
+	std::vector<OrderedPiece> ready;
+	std::vector<OrderedPiece> pool;
+	size_t unwritten;
+	bool writing;
+	std::mutex lock;
+	std::condition_variable advanced;
+
+	// estimated cost per motif, and the start-early rule's settings
+	std::vector<double> weight;
+	double heavyMin;
+	int lookAhead;
+
+	OrderedOutput(FILE* f, int count) : fp(f), n(count), fileCursor(0), next(0),
+			started(count, 0), done(count, 0), held(count), unwritten(0), writing(false),
+			heavyMin(INFINITY), lookAhead(64) {}
+	// a motif at 8x the mean estimate or more is heavy
+	void setWeights(const std::vector<double>& w) {
+		weight = w;
+		double sum = 0.0;
+		for (size_t k=0;k<w.size();k++) sum += w[k];
+		const double mean = w.empty() ? 0.0 : sum/(double)w.size();
+		heavyMin = (mean > 0.0) ? 8.0*mean : INFINITY;
+	}
+	~OrderedOutput() {
+		for (size_t j=0;j<pool.size();j++) free(pool[j].data);
+	}
+
+	// The next motif to scan. Called once per motif, so one is always left.
+	int take() {
+		std::unique_lock<std::mutex> g(lock);
+		while (1) {
+			while (started[fileCursor]) fileCursor++;
+			// When the head has not started, fileCursor is the head.
+			if (unwritten <= orderedCap || !started[next]) {
+				int k = fileCursor;
+				// with the head under way, the heaviest motif within the
+				// look-ahead goes first, so that it does not run alone at the
+				// end; only its own output waits for its turn
+				if (started[next] && !weight.empty()) {
+					const int end = (fileCursor + lookAhead < n) ? fileCursor + lookAhead : n;
+					double best = heavyMin;
+					for (int j=fileCursor;j<end;j++) {
+						if (!started[j] && weight[j] >= best) {
+							best = weight[j];
+							k = j;
+						}
+					}
+				}
+				started[k] = 1;
+				return k;
+			}
+			// The head is running on another thread; its finish() wakes us.
+			advanced.wait(g);
+		}
+	}
+	// Writes the queue until it is empty, unless another thread is already
+	// writing it. Called with g locked; returns with g locked.
+	void drain(std::unique_lock<std::mutex>& g) {
+		if (writing) return;
+		writing = true;
+		std::vector<OrderedPiece> batch;
+		while (!ready.empty()) {
+			batch.swap(ready);
+			g.unlock();
+			for (size_t j=0;j<batch.size();j++) fwrite(batch[j].data, 1, batch[j].len, fp);
+			g.lock();
+			for (size_t j=0;j<batch.size();j++) {
+				unwritten -= batch[j].len;
+				if (batch[j].cap > 0) {
+					pool.push_back(batch[j]);
+				} else {
+					delete [](batch[j].data);
+				}
+			}
+			batch.clear();
+		}
+		writing = false;
+		advanced.notify_all();
+	}
+	void promote(int k) {
+		std::vector<OrderedPiece>& h = held[k];
+		ready.insert(ready.end(), h.begin(), h.end());
+		std::vector<OrderedPiece>().swap(h);
+	}
+	// Lines of motif k in buf[0, len).
+	void emit(int k, char*& buf, size_t len, size_t& cap) {
+		OrderedPiece piece = {NULL, len, 0};
+		if (len < orderedCopyMax) {
+			piece.data = new char[len];
+			memcpy(piece.data, buf, len);
+		}
+		std::unique_lock<std::mutex> g(lock);
+		if (piece.data == NULL) {
+			piece.data = buf;
+			piece.cap = cap;
+			if (pool.empty()) {
+				buf = NULL;
+				cap = 0;
+			} else {
+				buf = pool.back().data;
+				cap = pool.back().cap;
+				pool.pop_back();
+			}
+		}
+		unwritten += len;
+		if (k == next) {
+			ready.push_back(piece);
+			drain(g);
+		} else {
+			held[k].push_back(piece);
+		}
+	}
+	void finish(int k) {
+		std::unique_lock<std::mutex> g(lock);
+		done[k] = 1;
+		while (next < n && done[next]) {
+			promote(next);
+			next++;
+		}
+		// The new head may be running: what it has so far joins the queue,
+		// the rest comes through emit().
+		if (next < n) promote(next);
+		advanced.notify_all();
+		drain(g);
+	}
+};
+static OrderedOutput* orderedOut = NULL;
+// The index entries a motif's scan will visit, estimated as the pivot choice
+// in MotifScanTables::buildSix does: the normal approximation of a 7-mer
+// passing (base composition from the index's 7-mer counts), at the best
+// pivot window, both strands, times the 7-mers indexed; 0 for a motif the
+// 7-mer index does not serve. It orders the scan only.
+// comp: the 7-mers' first-base composition, total: the 7-mers
+// indexed (both from count7, computed once by the caller).
+static double motifScanCost(Motif* motif, const double* comp, double total) {
+	const int mlen = motif->length;
+	if (mlen < 7 || total <= 0.0) return 0.0;
+	// log-odds as logxform makes them, leaving the motif as it is
+	std::vector<double> lo((size_t)mlen*4);
+	for (int j=0;j<mlen;j++) {
+		for (int b=0;b<4;b++) {
+			double v = motif->m[j][b];
+			if (!motif->logFlag) {
+				if (v < MOTIF_PROBABILITY_MINIMUM) v = MOTIF_PROBABILITY_MINIMUM;
+				v = log(v/0.25);
+			}
+			lo[j*4+b] = v;
+		}
+	}
+	double allBest = 0.0;
+	std::vector<double> best((size_t)mlen);
+	for (int j=0;j<mlen;j++) {
+		double v = lo[j*4];
+		for (int b=1;b<4;b++) if (lo[j*4+b] > v) v = lo[j*4+b];
+		best[j] = v;
+		allBest += v;
+	}
+	const double cutEst = motif->threshold - 1e-6;
+	double bestP = -1.0;
+	for (int a=0;a+7<=mlen;a++) {
+		double inside = 0.0;
+		for (int t=0;t<7;t++) inside += best[a+t];
+		const double need = cutEst - (allBest - inside);
+		double pass = 0.0;
+		for (int st=0;st<2;st++) {
+			double mu = 0.0;
+			double var = 0.0;
+			for (int t=0;t<7;t++) {
+				double m1 = 0.0;
+				double m2 = 0.0;
+				for (int b=0;b<4;b++) {
+					const double v = (st == 0) ? lo[(a+t)*4+b] : lo[(a+t)*4+3-b];
+					m1 += comp[b]*v;
+					m2 += comp[b]*v*v;
+				}
+				mu += m1;
+				var += m2 - m1*m1;
+			}
+			const double sd = sqrt(var > 0.0 ? var : 0.0) + 1e-12;
+			pass += 0.5*erfc((need - mu)/sd/sqrt(2.0));
+		}
+		if (bestP < 0.0 || pass < bestP) bestP = pass;
+	}
+	return (bestP > 0.0) ? bestP*total : 0.0;
+}
+// The motif this thread is scanning for orderedOut, or -1.
+static thread_local int orderedMotif = -1;
+
+// Per-thread output for find and -mscore: lines are formatted here and
+// written to the shared FILE in blocks, so threads do not take its lock once
+// per line.
+static thread_local char* scanOut = NULL;
+static thread_local size_t scanOutLen = 0;
+static thread_local size_t scanOutCap = 0;
+static void scanOutFlush(FILE* fp) {
+	if (scanOutLen > 0 && fp != NULL) {
+		if (orderedMotif >= 0) {
+			orderedOut->emit(orderedMotif, scanOut, scanOutLen, scanOutCap);
+		} else {
+			fwrite(scanOut, 1, scanOutLen, fp);
+		}
+	}
+	scanOutLen = 0;
+}
+// printf("%.6lf", x) without printf, for the values a motif score takes.
+// Writes into out (at least 512 bytes) and returns the length. Values that
+// are not finite, at least 1e6 in magnitude, or within 1e-3 of a rounding tie
+// in the sixth decimal go through snprintf, so the bytes are printf's.
+static int formatFixed6(double x, char* out) {
+	double ax = fabs(x);
+	if (!(ax < 1e6)) return snprintf(out, 512, "%.6lf", x);
+	// x*1e6 is within 1.2e-4 of the exact product for |x| < 1e6, so away
+	// from a tie the nearest integer is the one printf rounds to.
+	double y = ax * 1e6;
+	double fl = floor(y);
+	double frac = y - fl;
+	if (frac > 0.499 && frac < 0.501) return snprintf(out, 512, "%.6lf", x);
+	unsigned long long r = (unsigned long long)fl + (frac > 0.5 ? 1 : 0);
+	unsigned long long ip = r / 1000000ULL;
+	unsigned int fp6 = (unsigned int)(r % 1000000ULL);
+	char tmp[24];
+	int n = 0;
+	do {
+		tmp[n++] = (char)('0' + ip % 10);
+		ip /= 10;
+	} while (ip > 0);
+	int len = 0;
+	if (signbit(x)) out[len++] = '-';
+	while (n > 0) out[len++] = tmp[--n];
+	out[len++] = '.';
+	for (int d=5;d>=0;d--) {
+		out[len+d] = (char)('0' + fp6 % 10);
+		fp6 /= 10;
+	}
+	len += 6;
+	out[len] = '\0';
+	return len;
+}
+
+// One site line, `name\tpos\tsite\tmotif\tstrand\tscore\n`, the bytes
+// "%s\t%d\t%.*s\t%s\t%c\t%.6lf\n" gives; siteLen < 0 means site is a C string.
+static void scanOutSite(FILE* fp, const char* name, int pos, const char* site, int siteLen,
+		const char* motifName, char strand, double score) {
+	size_t nameLen = strlen(name);
+	size_t sLen = siteLen < 0 ? strlen(site) : strnlen(site, (size_t)siteLen);
+	size_t mLen = strlen(motifName);
+	size_t need = nameLen + sLen + mLen + 16 + 24 + 512;
+	if (scanOutCap - scanOutLen < need) {
+		size_t cap = scanOutBlock;
+		if (cap < 2*scanOutCap) cap = 2*scanOutCap;
+		if (cap < scanOutLen + need) cap = scanOutLen + need;
+		char* grown = chunkArray<char>((long)cap);
+		if (scanOutLen > 0) memcpy(grown, scanOut, scanOutLen);
+		free(scanOut);
+		scanOut = grown;
+		scanOutCap = cap;
+	}
+	char* o = scanOut + scanOutLen;
+	memcpy(o, name, nameLen);
+	o += nameLen;
+	*o++ = '\t';
+	long long p = pos;
+	if (p < 0) {
+		*o++ = '-';
+		p = -p;
+	}
+	char digits[24];
+	int nd = 0;
+	do {
+		digits[nd++] = (char)('0' + p % 10);
+		p /= 10;
+	} while (p > 0);
+	while (nd > 0) *o++ = digits[--nd];
+	*o++ = '\t';
+	memcpy(o, site, sLen);
+	o += sLen;
+	*o++ = '\t';
+	memcpy(o, motifName, mLen);
+	o += mLen;
+	*o++ = '\t';
+	*o++ = strand;
+	*o++ = '\t';
+	o += formatFixed6(score, o);
+	*o++ = '\n';
+	scanOutLen = o - scanOut;
+	if (scanOutLen > (1<<20)) scanOutFlush(fp);
+}
+
+MotifScanTables::MotifScanTables() {
+	length = 0;
+	K = 0;
+	restOfBest = 0.0;
+	fwd = NULL;
+	rev = NULL;
+	sel = NULL;
+	gap = NULL;
+	size = 0;
+	nblocks = 0;
+	blockStart[0] = 0;
+	blockStart[1] = 0;
+	blockLen[0] = 0;
+	blockLen[1] = 0;
+	blockRest = 0.0;
+	bfwd = new double[2*3125];
+	brev = new double[2*3125];
+	indexable = 0;
+	pivot[0] = 0;
+	pivot[1] = 0;
+	npass[0] = 0;
+	npass[1] = 0;
+	pass[0] = new int[3125];
+	pass[1] = new int[3125];
+	six = 0;
+	sixP = 6;
+	s6n = 0;
+	s6Rest = 0.0;
+	for (int st=0;st<2;st++) {
+		for (int q=0;q<3;q++) {
+			t6[st][q] = NULL;
+			o5[st][q] = NULL;
+			o5x[st][q] = NULL;
+			s6max[st][q] = 0.0;
+		}
+		s6pass[st] = NULL;
+		s6passScore[st] = NULL;
+		s6passGap[st] = NULL;
+		s6npass[st] = 0;
+		s6pivot[st] = 0;
+		s6oth[st][0] = 1;
+		s6oth[st][1] = 2;
+	}
+	for (int q=0;q<3;q++) {
+		s6Start[q] = 0;
+		s6Len[q] = 0;
+		o5Width[q] = 0;
+		o5Unused[q] = 1;
+	}
+}
+MotifScanTables::~MotifScanTables() {
+	delete []fwd;
+	delete []rev;
+	delete []sel;
+	delete []gap;
+	delete []bfwd;
+	delete []brev;
+	delete []pass[0];
+	delete []pass[1];
+	for (int st=0;st<2;st++) {
+		for (int q=0;q<3;q++) {
+			delete [](t6[st][q]);
+			delete [](o5[st][q]);
+			delete [](o5x[st][q]);
+		}
+		delete [](s6pass[st]);
+		delete [](s6passScore[st]);
+		delete [](s6passGap[st]);
+	}
+}
+void MotifScanTables::build(Motif* motif, int blocks) {
+	int mlen = motif->length;
+	length = mlen;
+	if (size < mlen+1) {
+		delete []fwd;
+		delete []rev;
+		delete []sel;
+		delete []gap;
+		size = mlen+1;
+		fwd = new double[size*5];
+		rev = new double[size*5];
+		sel = new int[size];
+		gap = new double[size];
+	}
+	for (int j=0;j<mlen;j++) {
+		for (int k=0;k<4;k++) {
+			fwd[j*5+k] = motif->m[j][k];
+			rev[j*5+k] = motif->m[j][3-k];
+		}
+		fwd[j*5+4] = -INFINITY;
+		rev[j*5+4] = -INFINITY;
+	}
+
+	// The bound. For each position, the best column; positions are ranked by
+	// how far a uniform base falls below that best (largest first), and the
+	// first K are scored exactly for every window, the rest at their best.
+	for (int j=0;j<mlen;j++) {
+		double best = motif->m[j][0];
+		double mean = 0.0;
+		for (int k=0;k<4;k++) {
+			if (motif->m[j][k] > best) best = motif->m[j][k];
+			mean += motif->m[j][k];
+		}
+		gap[j] = best - mean*0.25;
+		sel[j] = j;
+	}
+	for (int a=1;a<mlen;a++) {
+		int x = sel[a];
+		int b = a-1;
+		while (b >= 0 && gap[sel[b]] < gap[x]) {
+			sel[b+1] = sel[b];
+			b--;
+		}
+		sel[b+1] = x;
+	}
+	// Four positions: in a sweep of K = 3 to 8 and an adaptive rule on 5,000
+	// ATAC peaks x 472 known motifs, K = 4 and 5 were fastest.
+	K = mlen < 4 ? mlen : 4;
+	restOfBest = 0.0;
+	for (int t=K;t<mlen;t++) {
+		double best = motif->m[sel[t]][0];
+		for (int k=1;k<4;k++) if (motif->m[sel[t]][k] > best) best = motif->m[sel[t]][k];
+		restOfBest += best;
+	}
+
+	// find's blocks: the windows of the motif with the largest summed gap,
+	// two that do not overlap (5+5 from width 10, 5+4 or 4+5 at 9, 4+4 at 8),
+	// or one (5 for widths 5-7, 4 at width 4).
+	nblocks = 0;
+	if (!blocks) {
+		indexable = 0;
+		npass[0] = 0;
+		npass[1] = 0;
+		return;
+	}
+	{
+		int options[3][2];
+		int numOptions = 0;
+		if (mlen >= 10) {
+			options[numOptions][0] = 5; options[numOptions][1] = 5; numOptions++;
+		} else if (mlen == 9) {
+			options[numOptions][0] = 5; options[numOptions][1] = 4; numOptions++;
+			options[numOptions][0] = 4; options[numOptions][1] = 5; numOptions++;
+		} else if (mlen == 8) {
+			options[numOptions][0] = 4; options[numOptions][1] = 4; numOptions++;
+		}
+		double bestPair = -1.0;
+		for (int o=0;o<numOptions;o++) {
+			int k0 = options[o][0];
+			int k1 = options[o][1];
+			for (int a=0;a+k0<=mlen;a++) {
+				double ga = 0.0;
+				for (int t=0;t<k0;t++) ga += gap[a+t];
+				for (int b=a+k0;b+k1<=mlen;b++) {
+					double gb = 0.0;
+					for (int t=0;t<k1;t++) gb += gap[b+t];
+					if (ga+gb > bestPair) {
+						bestPair = ga+gb;
+						blockStart[0] = a;
+						blockLen[0] = k0;
+						blockStart[1] = b;
+						blockLen[1] = k1;
+						nblocks = 2;
+					}
+				}
+			}
+		}
+		if (numOptions == 0 && mlen >= 4) {
+			int k = (mlen >= 5) ? 5 : 4;
+			for (int a=0;a+k<=mlen;a++) {
+				double ga = 0.0;
+				for (int t=0;t<k;t++) ga += gap[a+t];
+				if (ga > bestPair) {
+					bestPair = ga;
+					blockStart[0] = a;
+					blockLen[0] = k;
+					blockStart[1] = a;
+					blockLen[1] = k;
+					nblocks = 1;
+				}
+			}
+		}
+	}
+	if (nblocks > 0) {
+		blockRest = 0.0;
+		for (int j=0;j<mlen;j++) {
+			int inBlock = 0;
+			for (int q=0;q<nblocks;q++) {
+				if (j >= blockStart[q] && j < blockStart[q]+blockLen[q]) inBlock = 1;
+			}
+			if (inBlock) continue;
+			double best = motif->m[j][0];
+			for (int k=1;k<4;k++) if (motif->m[j][k] > best) best = motif->m[j][k];
+			blockRest += best;
+		}
+		// Forward: motif positions a..a+k-1 read the 5-mer in order; reverse
+		// complement: the 5-mer at i-a-k+1 holds positions a+k-1, ..., a of
+		// the window that ends at i. Built by prefix sums over the first t
+		// digits (the column for code 4 is -inf, so any N gives -inf); a
+		// block of 4 repeats its 4-digit sums over the fifth digit.
+		double pf[3125+625+125+25+5];
+		double pr[3125+625+125+25+5];
+		for (int q=0;q<2;q++) {
+			if (q >= nblocks) {
+				for (int idx=0;idx<3125;idx++) {
+					bfwd[q*3125+idx] = 0.0;
+					brev[q*3125+idx] = 0.0;
+				}
+				continue;
+			}
+			int a = blockStart[q];
+			int k = blockLen[q];
+			double* lf = pf;
+			double* lr = pr;
+			for (int d=0;d<5;d++) {
+				lf[d] = 0.0 + fwd[a*5+d];
+				lr[d] = 0.0 + rev[(a+k-1)*5+d];
+			}
+			int width = 5;
+			for (int t=1;t<k;t++) {
+				double* nf = lf + width;
+				double* nr = lr + width;
+				for (int x=0;x<width;x++) {
+					for (int d=0;d<5;d++) {
+						nf[x*5+d] = lf[x] + fwd[(a+t)*5+d];
+						nr[x*5+d] = lr[x] + rev[(a+k-1-t)*5+d];
+					}
+				}
+				lf = nf;
+				lr = nr;
+				width *= 5;
+			}
+			for (int idx=0;idx<3125;idx++) {
+				int x = (k == 5) ? idx : idx/5;
+				bfwd[q*3125+idx] = lf[x];
+				brev[q*3125+idx] = lr[x];
+			}
+		}
+	}
+
+	// find's index. A window can survive the bound only if its pivot-block
+	// 4-mer scores at least cut - blockRest - (the other block's best); the
+	// 1e-9 slack covers rounding, so every window the bound keeps is visited.
+	indexable = 0;
+	npass[0] = 0;
+	npass[1] = 0;
+	if (nblocks > 0) {
+		indexable = 1;
+		for (int x=0;x<2*3125;x++) {
+			if (bfwd[x] != bfwd[x] || brev[x] != brev[x]) indexable = 0;
+		}
+	}
+	if (indexable) {
+		const double cut = motif->threshold - 1e-6;
+		for (int st=0;st<2;st++) {
+			const double* T = (st == 0) ? bfwd : brev;
+			double need[2] = {0.0, 0.0};
+			int count[2] = {0, 0};
+			for (int q=0;q<nblocks;q++) {
+				const double* To = T + (1-q)*3125;
+				double maxOther = -INFINITY;
+				for (int x=0;x<3125;x++) if (To[x] > maxOther) maxOther = To[x];
+				need[q] = cut - blockRest - maxOther - 1e-9;
+				for (int x=0;x<3125;x++) if (!(T[q*3125+x] < need[q])) count[q]++;
+			}
+			int q = (nblocks == 2 && count[1] < count[0]) ? 1 : 0;
+			pivot[st] = q;
+			npass[st] = 0;
+			for (int x=0;x<3125;x++) {
+				if (!(T[q*3125+x] < need[q])) pass[st][npass[st]++] = x;
+			}
+		}
+	}
+}
+
+int MotifScanTables::buildSix(Motif* motif, int P, const int* countP) {
+	six = 0;
+	sixP = P;
+	const int mlen = length;
+	if (mlen < P) return 0;
+	s6n = 1;
+	for (int q=0;q<3;q++) {
+		s6Start[q] = 0;
+		s6Len[q] = 0;
+	}
+	s6Len[0] = P;
+	if (P == 7 && countP != NULL && mlen > P) {
+		// The pivot: the window of 7 least likely to pass, from a normal
+		// approximation of its score over random 7-mers with the sequences'
+		// base composition (per-position mean and variance), both strands. A
+		// window's 7-mer can pass only if it scores at least cut - (the best
+		// of every position outside it), whatever the other blocks are. The
+		// other blocks then tighten the bound: the largest-gap window of up
+		// to 7 positions on each side of the pivot.
+		static thread_local const int* compFor = NULL;
+		static thread_local double comp[4];
+		if (compFor != countP) {
+			double c4[4] = {0.0, 0.0, 0.0, 0.0};
+			for (int x=0;x<16384;x++) c4[x >> 12] += countP[x];
+			const double sum = c4[0]+c4[1]+c4[2]+c4[3];
+			for (int b=0;b<4;b++) comp[b] = (sum > 0.0) ? c4[b]/sum : 0.25;
+			compFor = countP;
+		}
+		double allBest = 0.0;
+		for (int j=0;j<mlen;j++) {
+			double best = motif->m[j][0];
+			for (int k=1;k<4;k++) if (motif->m[j][k] > best) best = motif->m[j][k];
+			allBest += best;
+		}
+		const double cutEst = motif->threshold - 1e-6;
+		double bestP = -1.0;
+		int bestA = 0;
+		for (int a=0;a+7<=mlen;a++) {
+			double inside = 0.0;
+			for (int t=0;t<7;t++) {
+				double best = motif->m[a+t][0];
+				for (int k=1;k<4;k++) if (motif->m[a+t][k] > best) best = motif->m[a+t][k];
+				inside += best;
+			}
+			const double need = cutEst - (allBest - inside);
+			double pass = 0.0;
+			for (int st=0;st<2;st++) {
+				double mu = 0.0;
+				double var = 0.0;
+				for (int t=0;t<7;t++) {
+					const double* row = motif->m[a+t];
+					double m1 = 0.0;
+					double m2 = 0.0;
+					for (int b=0;b<4;b++) {
+						const double v = (st == 0) ? row[b] : row[3-b];
+						m1 += comp[b]*v;
+						m2 += comp[b]*v*v;
+					}
+					mu += m1;
+					var += m2 - m1*m1;
+				}
+				const double sd = sqrt(var > 0.0 ? var : 0.0) + 1e-12;
+				pass += 0.5*erfc((need - mu)/sd/sqrt(2.0));
+			}
+			if (bestP < 0.0 || pass < bestP) {
+				bestP = pass;
+				bestA = a;
+			}
+		}
+		s6Start[0] = bestA;
+		const int sides[2][2] = {{0, bestA}, {bestA+7, mlen}};
+		for (int sd=0;sd<2;sd++) {
+			const int from = sides[sd][0];
+			const int to = sides[sd][1];
+			const int k = (to-from < 7) ? to-from : 7;
+			if (k <= 0) continue;
+			double bestGap = -1.0;
+			int bestB = from;
+			for (int b=from;b+k<=to;b++) {
+				double g = 0.0;
+				for (int t=0;t<k;t++) g += gap[b+t];
+				if (g > bestGap) {
+					bestGap = g;
+					bestB = b;
+				}
+			}
+			s6Start[s6n] = bestB;
+			s6Len[s6n] = k;
+			s6n++;
+		}
+	} else if (mlen >= 2*P) {
+		// the two windows of P with the largest summed gap
+		double bestPair = -1.0;
+		for (int a=0;a+P<=mlen;a++) {
+			double ga = 0.0;
+			for (int t=0;t<P;t++) ga += gap[a+t];
+			for (int b=a+P;b+P<=mlen;b++) {
+				double gb = 0.0;
+				for (int t=0;t<P;t++) gb += gap[b+t];
+				if (ga+gb > bestPair) {
+					bestPair = ga+gb;
+					s6Start[0] = a;
+					s6Start[1] = b;
+				}
+			}
+		}
+		s6n = 2;
+		s6Len[1] = P;
+	} else if (mlen > P) {
+		// a block of P at either end, whichever has the larger gap, and the rest
+		double g0 = 0.0;
+		double g1 = 0.0;
+		for (int t=0;t<P;t++) {
+			g0 += gap[t];
+			g1 += gap[mlen-P+t];
+		}
+		s6n = 2;
+		s6Len[1] = mlen-P;
+		if (g0 >= g1) {
+			s6Start[0] = 0;
+			s6Start[1] = P;
+		} else {
+			s6Start[0] = mlen-P;
+			s6Start[1] = 0;
+		}
+	}
+	s6Rest = 0.0;
+	for (int j=0;j<mlen;j++) {
+		int inBlock = 0;
+		for (int q=0;q<s6n;q++) {
+			if (j >= s6Start[q] && j < s6Start[q]+s6Len[q]) inBlock = 1;
+		}
+		if (inBlock) continue;
+		double best = motif->m[j][0];
+		for (int k=1;k<4;k++) if (motif->m[j][k] > best) best = motif->m[j][k];
+		s6Rest += best;
+	}
+
+	// Tables. Forward, digit t of a k-mer is motif position a+t; reverse
+	// complement, a+k-1-t. A block of 6 or 7: its first three digits' sum
+	// plus its last k-3 digits' sum (the bound only; the 1e-6 slack covers
+	// the rounding).
+	for (int q=0;q<s6n;q++) {
+		const int a = s6Start[q];
+		const int k = s6Len[q];
+		if (k >= 6) {
+			const int loDigits = k-3;
+			const int loSize = 1 << (2*loDigits);
+			double* af = halfHi[0][q];
+			double* ar = halfHi[1][q];
+			double* bf = halfLo[0][q];
+			double* br = halfLo[1][q];
+			for (int x=0;x<64;x++) {
+				const int d0 = x >> 4, d1 = (x >> 2) & 3, d2 = x & 3;
+				af[x] = (fwd[a*5+d0] + fwd[(a+1)*5+d1]) + fwd[(a+2)*5+d2];
+				ar[x] = (rev[(a+k-1)*5+d0] + rev[(a+k-2)*5+d1]) + rev[(a+k-3)*5+d2];
+			}
+			for (int y=0;y<loSize;y++) {
+				double sf = 0.0;
+				double sr = 0.0;
+				for (int t=0;t<loDigits;t++) {
+					const int d = (y >> (2*(loDigits-1-t))) & 3;
+					if (t == 0) {
+						sf = fwd[(a+3)*5+d];
+						sr = rev[(a+k-4)*5+d];
+					} else {
+						sf = sf + fwd[(a+3+t)*5+d];
+						sr = sr + rev[(a+k-4-t)*5+d];
+					}
+				}
+				bf[y] = sf;
+				br[y] = sr;
+			}
+			for (int st=0;st<2;st++) {
+				if (t6[st][q] == NULL) t6[st][q] = new double[16385];
+			}
+			double* tf = t6[0][q];
+			double* tr = t6[1][q];
+			for (int hi=0;hi<64;hi++) {
+				const double hf = af[hi];
+				const double hr = ar[hi];
+				for (int lo=0;lo<loSize;lo++) {
+					tf[hi*loSize+lo] = hf + bf[lo];
+					tr[hi*loSize+lo] = hr + br[lo];
+				}
+			}
+			tf[64*loSize] = -INFINITY;
+			tr[64*loSize] = -INFINITY;
+			if (P == 7 && k == 6) {
+				// code >> 2: 4096 + v for a prefix of exactly 6
+				// bases, 8192 for fewer
+				for (int x=0;x<4096;x++) {
+					tf[4096+x] = tf[x];
+					tr[4096+x] = tr[x];
+				}
+				tf[8192] = -INFINITY;
+				tr[8192] = -INFINITY;
+			}
+		} else {
+			double lf[5+25+125+625+3125];
+			double lr[5+25+125+625+3125];
+			double* pf = lf;
+			double* pr = lr;
+			for (int d=0;d<5;d++) {
+				pf[d] = 0.0 + fwd[a*5+d];
+				pr[d] = 0.0 + rev[(a+k-1)*5+d];
+			}
+			int width = 5;
+			for (int t=1;t<k;t++) {
+				double* nf = pf + width;
+				double* nr = pr + width;
+				for (int x=0;x<width;x++) {
+					for (int d=0;d<5;d++) {
+						nf[x*5+d] = pf[x] + fwd[(a+t)*5+d];
+						nr[x*5+d] = pr[x] + rev[(a+k-1-t)*5+d];
+					}
+				}
+				pf = nf;
+				pr = nr;
+				width *= 5;
+			}
+			int unused = 1;
+			for (int t=k;t<5;t++) unused *= 5;
+			for (int st=0;st<2;st++) {
+				if (o5[st][q] == NULL) o5[st][q] = new double[3125];
+			}
+			o5Width[q] = width;
+			o5Unused[q] = unused;
+			for (int x=0;x<width;x++) {
+				for (int r=0;r<unused;r++) {
+					o5[0][q][x*unused+r] = pf[x];
+					o5[1][q][x*unused+r] = pr[x];
+				}
+			}
+			if (P == 7) {
+				// the slots of code >> 4: below 3072 a prefix of 5 or
+				// more bases (its first five, x & 1023); from 3072, y = x - 3072
+				// = 4w + j holds a prefix of 4 (j = 0, value w), 3 (j = 1, w =
+				// 4v), 2 (j = 2, w = 16v) or 1 (j = 3, w = 64v); else none
+				for (int st=0;st<2;st++) {
+					if (o5x[st][q] == NULL) o5x[st][q] = new double[4096];
+				}
+				for (int x=0;x<4096;x++) {
+					int r = 0;
+					int w = 0;
+					if (x < 3072) {
+						r = 5;
+						w = x & 1023;
+					} else {
+						const int y = x - 3072;
+						const int ww = y >> 2;
+						const int j = y & 3;
+						if (j == 0) {
+							r = 4;
+							w = ww;
+						} else if (j == 1 && (ww & 3) == 0) {
+							r = 3;
+							w = ww >> 2;
+						} else if (j == 2 && (ww & 15) == 0) {
+							r = 2;
+							w = ww >> 4;
+						} else if (j == 3 && (ww & 63) == 0) {
+							r = 1;
+							w = ww >> 6;
+						}
+					}
+					double vf = -INFINITY;
+					double vr = -INFINITY;
+					if (r >= k) {
+						// the prefix's first k bases, as the base-5 index of
+						// the level-k sums
+						const int v = w >> (2*(r-k));
+						int idx = 0;
+						for (int t=0;t<k;t++) idx = idx*5 + ((v >> (2*(k-1-t))) & 3);
+						vf = pf[idx];
+						vr = pr[idx];
+					}
+					o5x[0][q][x] = vf;
+					o5x[1][q][x] = vr;
+				}
+			}
+		}
+	}
+	for (int q=0;q<s6n;q++) {
+		for (int st=0;st<2;st++) {
+			const int k = s6Len[q];
+			if (k >= 6) {
+				// the sum of two finite halves is never NaN
+				const int loSize = 1 << (2*(k-3));
+				int finite = 1;
+				for (int x=0;x<64;x++) if (!std::isfinite(halfHi[st][q][x])) finite = 0;
+				for (int y=0;y<loSize;y++) if (!std::isfinite(halfLo[st][q][y])) finite = 0;
+				if (finite) continue;
+				const double* T = t6[st][q];
+				for (int x=0;x<64*loSize;x++) if (T[x] != T[x]) return 0;
+			} else {
+				for (int x=0;x<o5Width[q];x++) {
+					const double v = o5[st][q][x*o5Unused[q]];
+					if (v != v) return 0;
+				}
+			}
+		}
+	}
+	// the blocks' gaps, to order the other blocks (the larger first: it
+	// rejects more entries alone)
+	double blockGap[3] = {0.0, 0.0, 0.0};
+	for (int q=0;q<s6n;q++) {
+		for (int t=0;t<s6Len[q];t++) blockGap[q] += gap[s6Start[q]+t];
+	}
+
+	// The pivot: of the blocks of P, the one whose passing P-mers occur
+	// least often in the sequences. A window survives the bound only if its
+	// pivot P-mer scores at least cut - s6Rest - (the other blocks' best);
+	// the 1e-9 slack covers rounding. A table's maximum is maxHi + maxLo
+	// (rounding is monotone), and a row hi whose halfHi + maxLo is below need
+	// holds no entry at or above it.
+	const double cut = motif->threshold - 1e-6;
+	const int loSizeP = 1 << (2*(P-3));
+	for (int st=0;st<2;st++) {
+		if (s6pass[st] == NULL) {
+			s6pass[st] = new int[16384];
+			s6passScore[st] = new double[16384];
+			s6passGap[st] = new double[16384];
+		}
+		double maxLo[3] = {0.0, 0.0, 0.0};
+		int pivotBlocks = 0;
+		for (int q=0;q<s6n;q++) {
+			s6max[st][q] = -INFINITY;
+			const int k = s6Len[q];
+			if (k >= 6) {
+				if (k == P) pivotBlocks++;
+				const int loSize = 1 << (2*(k-3));
+				double maxHi = -INFINITY;
+				maxLo[q] = -INFINITY;
+				for (int x=0;x<64;x++) if (halfHi[st][q][x] > maxHi) maxHi = halfHi[st][q][x];
+				for (int y=0;y<loSize;y++) if (halfLo[st][q][y] > maxLo[q]) maxLo[q] = halfLo[st][q][y];
+				s6max[st][q] = maxHi + maxLo[q];
+			} else {
+				for (int x=0;x<o5Width[q];x++) {
+					if (o5[st][q][x*o5Unused[q]] > s6max[st][q]) s6max[st][q] = o5[st][q][x*o5Unused[q]];
+				}
+			}
+		}
+		int bestQ = -1;
+		long long bestCount = 0;
+		double bestNeed = 0.0;
+		for (int q=0;q<s6n;q++) {
+			if (s6Len[q] != P) continue;
+			double others = 0.0;
+			for (int r=0;r<s6n;r++) if (r != q) others += s6max[st][r];
+			const double need = cut - s6Rest - others - 1e-9;
+			long long total = 0;
+			if (pivotBlocks > 1) {
+				const double* T = t6[st][q];
+				for (int hi=0;hi<64;hi++) {
+					if (halfHi[st][q][hi] + maxLo[q] < need) continue;
+					for (int x=hi*loSizeP;x<hi*loSizeP+loSizeP;x++) {
+						if (!(T[x] < need)) total += (countP != NULL) ? countP[x] : 1;
+					}
+				}
+			}
+			if (bestQ < 0 || total < bestCount) {
+				bestQ = q;
+				bestCount = total;
+				bestNeed = need;
+			}
+		}
+		s6pivot[st] = bestQ;
+		int no = 0;
+		for (int r=0;r<s6n;r++) if (r != bestQ) s6oth[st][no++] = r;
+		if (no == 2 && blockGap[s6oth[st][1]] > blockGap[s6oth[st][0]]) {
+			const int tmp = s6oth[st][0];
+			s6oth[st][0] = s6oth[st][1];
+			s6oth[st][1] = tmp;
+		}
+		s6npass[st] = 0;
+		// The flanks: the bases before the pivot k-mer in sequence order
+		// (nearest first) are motif positions ap-1, ap-2 (forward) or,
+		// complemented, ap+P, ap+P+1 (reverse); the three after are ap+P,
+		// ap+P+1, ap+P+2 (forward) or ap-1, ap-2, ap-3 (reverse). A base b there
+		// can add at most m[pos][b] - (the position's best) to the bound,
+		// wherever the position falls (rest or another block); outside the
+		// motif it adds nothing. An entry reads an N, or a base past the
+		// sequence, as A: inside the motif either makes the window fail
+		// anyway (-inf, or out of its sequence), so the reading only lets
+		// through windows the exact score drops.
+		{
+			const int ap = s6Start[bestQ];
+			int lpos[2];
+			int rpos[3];
+			for (int j=0;j<2;j++) lpos[j] = (st == 0) ? ap-1-j : ap+P+j;
+			for (int j=0;j<3;j++) rpos[j] = (st == 0) ? ap+P+j : ap-1-j;
+			const double* tab = (st == 0) ? fwd : rev;
+			double dl[2][4];
+			double dr[3][4];
+			for (int j=0;j<5;j++) {
+				const int pos = (j < 2) ? lpos[j] : rpos[j-2];
+				double* dd = (j < 2) ? dl[j] : dr[j-2];
+				if (pos < 0 || pos >= mlen) {
+					for (int bb=0;bb<4;bb++) dd[bb] = 0.0;
+					continue;
+				}
+				double best = tab[pos*5];
+				for (int bb=1;bb<4;bb++) if (tab[pos*5+bb] > best) best = tab[pos*5+bb];
+				for (int bb=0;bb<4;bb++) dd[bb] = tab[pos*5+bb] - best;
+			}
+			for (int x=0;x<16;x++) s6flankL[st][x] = dl[0][x & 3] + dl[1][x >> 2];
+			for (int x=0;x<64;x++) s6flankR[st][x] = (dr[0][x & 3] + dr[1][(x >> 2) & 3]) + dr[2][x >> 4];
+		}
+		const double* T = t6[st][bestQ];
+		for (int hi=0;hi<64;hi++) {
+			if (halfHi[st][bestQ][hi] + maxLo[bestQ] < bestNeed) continue;
+			for (int x=hi*loSizeP;x<hi*loSizeP+loSizeP;x++) {
+				if (!(T[x] < bestNeed)) {
+					s6pass[st][s6npass[st]] = x;
+					s6passScore[st][s6npass[st]] = T[x];
+					s6passGap[st][s6npass[st]] = T[x] - bestNeed;
+					s6npass[st]++;
+				}
+			}
+		}
+	}
+	six = 1;
+	return 1;
+}
+
+// Base-4 6-mers of codes[0, length) into k6: 4096 where the 6-mer holds an N
+// or runs past the end. Base-5 5-mers into k5, first base most significant,
+// 4 past the end. A sequence shorter than 6 (4) gets all 4096 (3124).
+static void kmerCodes6(const unsigned char* codes, int length, unsigned short* k6) {
+	if (length < 6) {
+		for (int i=0;i<length;i++) k6[i] = 4096;
+		return;
+	}
+	int v = 0;
+	int lastN = -1;
+	for (int j=0;j<length;j++) {
+		v = ((v << 2) | (codes[j] & 3)) & 4095;
+		if (codes[j] == 4) lastN = j;
+		if (j >= 5) k6[j-5] = (unsigned short)((lastN >= j-5) ? 4096 : v);
+	}
+	for (int i=length-5;i<length;i++) k6[i] = 4096;
+}
+// A 7-mer chunk's one code array: each position's prefix code. With
+// r = the bases from the position on before an N or the sequence's end (at
+// most 7) and v the base-4 value of those r bases:
+//   r = 7: v (0-16383)    r = 6: 16384 + 4v    r = 5: 32768 + 16v
+//   r = 4: 49152 + 64v    r = 3: 49152 + 256v + 16
+//   r = 2: 49152 + 1024v + 32    r = 1: 49152 + 4096v + 48    r = 0: CK7_NONE
+// A block of 7 reads the code (16384 for any code past 16383), a block of 6
+// the code >> 2 (8192 past 8191), a block of 5 or fewer the code >> 4
+// (0-4095); every r >= the block's length has its own slots, which hold the
+// block's score of the prefix's first bases, and the rest are -inf.
+#define CK7_NONE 49232
+static void kmerCodes7(const unsigned char* codes, int length, unsigned short* k7) {
+	// by r: the offset, and the bits of the 7-base value kept
+	static const unsigned int base[8] = {CK7_NONE, 49152+48, 49152+32, 49152+16, 49152, 32768, 16384, 0};
+	static const unsigned int keep[8] = {0, 0x3000, 0x3C00, 0x3F00, 0x3FC0, 0x3FF0, 0x3FFC, 0x3FFF};
+	int run = 0;
+	unsigned int v = 0;
+	for (int p=length-1;p>=0;p--) {
+		const unsigned int b = codes[p];
+		run = (b == 4) ? 0 : run+1;
+		// the bases at p..p+6, p's the most significant (past the end: 0)
+		v = (v >> 2) | ((b & 3) << 12);
+		const int r = (run < 7) ? run : 7;
+		k7[p] = (unsigned short)(base[r] + (v & keep[r]));
+	}
+}
+static void kmerCodes5(const unsigned char* codes, int length, unsigned short* k5) {
+	if (length < 4) {
+		for (int i=0;i<length;i++) k5[i] = 3124;
+		return;
+	}
+	int v = 0;
+	for (int t=0;t<5;t++) v = v*5 + ((t < length) ? codes[t] : 4);
+	k5[0] = (unsigned short)v;
+	for (int i=1;i<length;i++) {
+		v = (v % 625)*5 + ((i+4 < length) ? codes[i+4] : 4);
+		k5[i] = (unsigned short)v;
+	}
+}
+void Sequence::prepareKmers(int withKmer5, unsigned char* codesAt) {
+	if (codes != NULL && !codesShared) delete []codes;
+	if (codesAt != NULL) {
+		codes = codesAt;
+		codesShared = 1;
+	} else {
+		codes = new unsigned char[length+1];
+		codesShared = 0;
+	}
+	for (int i=0;i<length;i++) codes[i] = motifScanCode[(unsigned char)s[i]];
+	if (kmer6 != NULL) delete []kmer6;
+	kmer6 = NULL;
+	if (kmer5 != NULL) delete []kmer5;
+	kmer5 = NULL;
+	if (length < 4 || !withKmer5) return;
+	kmer5 = new unsigned short[length];
+	kmerCodes5(codes, length, kmer5);
+}
+KmerChunk::KmerChunk() {
+	first = 0;
+	count = 0;
+	start = NULL;
+	pos = NULL;
+	sid = NULL;
+	cstart = NULL;
+	clen = NULL;
+	ck7 = NULL;
+	ck6 = NULL;
+	ck5 = NULL;
+	blockSeq = NULL;
+	flanks = 0;
+	codesBlock = NULL;
+}
+KmerChunk::~KmerChunk() {
+	// a 6/7-mer chunk's pos and code arrays come from chunkArray
+	const int fromChunkArray = (ck7 != NULL || ck6 != NULL);
+	delete []start;
+	if (fromChunkArray) {
+		free(pos);
+	} else {
+		delete []pos;
+	}
+	delete []sid;
+	delete []cstart;
+	delete []clen;
+	free(ck7);
+	free(ck6);
+	free(ck5);
+	delete []blockSeq;
+	free(codesBlock);
+}
+// The index holds a position when the first four bases of its 5-mer are
+// not N (the fifth may be N, or past the end).
+static int kmerHasN(int v) {
+	return (v/5)%5 == 4 || (v/25)%5 == 4 || (v/125)%5 == 4 || v/625 == 4;
+}
+// Runs fn(i) for every i in [0, n) on up to `threads` threads, which take
+// items in order from a shared counter.
+template <typename F>
+static void parallelFor(int n, int threads, F fn) {
+	if (threads > n) threads = n;
+	if (threads <= 1) {
+		for (int i=0;i<n;i++) fn(i);
+		return;
+	}
+	std::atomic<int> next(0);
+	std::vector<std::thread> pool;
+	for (int t=0;t<threads;t++) {
+		pool.emplace_back([&]() {
+			for (int i=next++;i<n;i=next++) fn(i);
+		});
+	}
+	for (size_t t=0;t<pool.size();t++) pool[t].join();
+}
+
+static void buildKmerChunk(Sequence** seqs, KmerChunk* c) {
+	const int first = c->first;
+	const int last = c->first + c->count;
+	c->start = new int[3126];
+	for (int v=0;v<3126;v++) c->start[v] = 0;
+	for (int q=first;q<last;q++) {
+		const unsigned short* km = seqs[q]->kmer5;
+		if (km == NULL) continue;
+		for (int p=0;p+4<=seqs[q]->length;p++) {
+			if (!kmerHasN(km[p])) c->start[km[p]+1]++;
+		}
+	}
+	for (int v=0;v<3125;v++) c->start[v+1] += c->start[v];
+	int total = c->start[3125];
+	c->pos = new int[total > 0 ? total : 1];
+	c->sid = new unsigned short[total > 0 ? total : 1];
+	int* cursor = new int[3125];
+	for (int v=0;v<3125;v++) cursor[v] = c->start[v];
+	for (int q=first;q<last;q++) {
+		const unsigned short* km = seqs[q]->kmer5;
+		if (km == NULL) continue;
+		for (int p=0;p+4<=seqs[q]->length;p++) {
+			if (kmerHasN(km[p])) continue;
+			int e = cursor[km[p]]++;
+			c->pos[e] = p;
+			c->sid[e] = (unsigned short)(q-first);
+		}
+	}
+	delete []cursor;
+}
+
+// A chunk of the P-mer index (P = 6 or 7): its sequences' 7-mer (P = 7),
+// 6-mer and 5-mer codes end to end, and the positions of each P-mer.
+// n items for a 6/7-mer chunk's arrays, released with free(): 2 MB or
+// more go in 2 MB-aligned memory advised MADV_HUGEPAGE, so the index visit's
+// random reads into them miss the TLB less. Also the chunks' codes
+// blocks and the sequences' text blocks.
+template <typename T>
+static T* chunkArray(long n) {
+	size_t bytes = (size_t)(n > 0 ? n : 1) * sizeof(T);
+	const size_t huge = (size_t)2 << 20;
+	void* p = NULL;
+	if (posix_memalign(&p, bytes >= huge ? huge : 64, bytes) != 0) {
+		fprintf(stderr, "!!! out of memory for the k-mer index !!!\n");
+		exit(1);
+	}
+#ifdef MADV_HUGEPAGE
+	if (bytes >= huge) (void)madvise(p, bytes, MADV_HUGEPAGE);
+#endif
+	return (T*)p;
+}
+// An allocator whose blocks come from chunkArray (huge pages from
+// 2 MB), for the FASTA load's piece texts.
+template <typename T>
+struct HugeAllocator {
+	typedef T value_type;
+	HugeAllocator() {}
+	template <typename U> HugeAllocator(const HugeAllocator<U>&) {}
+	T* allocate(size_t n) { return chunkArray<T>((long)n); }
+	void deallocate(T* p, size_t) { free(p); }
+	template <typename U> bool operator==(const HugeAllocator<U>&) const { return true; }
+	template <typename U> bool operator!=(const HugeAllocator<U>&) const { return false; }
+};
+static void buildKmerChunkP(Sequence** seqs, KmerChunk* c, int pad, int P) {
+	const int first = c->first;
+	const int last = c->first + c->count;
+	const int buckets = 1 << (2*P);
+	c->cstart = new int[c->count > 0 ? c->count : 1];
+	c->clen = new int[c->count > 0 ? c->count : 1];
+	long span = pad;
+	for (int q=first;q<last;q++) {
+		c->cstart[q-first] = (int)span;
+		c->clen[q-first] = seqs[q]->length;
+		span += seqs[q]->length;
+	}
+	span += pad;
+	// a 7-mer chunk has ck7 alone, in the prefix code
+	if (P == 7) {
+		c->ck7 = chunkArray<unsigned short>(span);
+		for (long j=0;j<pad;j++) {
+			c->ck7[j] = CK7_NONE;
+			c->ck7[span-1-j] = CK7_NONE;
+		}
+	} else {
+		c->ck6 = chunkArray<unsigned short>(span);
+		c->ck5 = chunkArray<unsigned short>(span);
+		for (long j=0;j<pad;j++) {
+			c->ck6[j] = 4096;
+			c->ck5[j] = 3124;
+			c->ck6[span-1-j] = 4096;
+			c->ck5[span-1-j] = 3124;
+		}
+	}
+	const unsigned short* ckP = (P == 7) ? c->ck7 : c->ck6;
+	c->start = new int[buckets+1];
+	for (int v=0;v<=buckets;v++) c->start[v] = 0;
+	for (int q=first;q<last;q++) {
+		const int at = c->cstart[q-first];
+		if (P == 7) {
+			kmerCodes7(seqs[q]->codes, seqs[q]->length, c->ck7+at);
+		} else {
+			kmerCodes6(seqs[q]->codes, seqs[q]->length, c->ck6+at);
+			kmerCodes5(seqs[q]->codes, seqs[q]->length, c->ck5+at);
+		}
+		const unsigned short* km = ckP+at;
+		for (int p=0;p<seqs[q]->length;p++) {
+			if (km[p] < buckets) c->start[km[p]+1]++;
+		}
+	}
+	for (int v=0;v<buckets;v++) c->start[v+1] += c->start[v];
+	int total = c->start[buckets];
+	c->pos = chunkArray<int>(total);
+	int* cursor = new int[buckets];
+	for (int v=0;v<buckets;v++) cursor[v] = c->start[v];
+	c->flanks = (span < (1L << 22));
+	for (int q=first;q<last;q++) {
+		const int at = c->cstart[q-first];
+		const unsigned short* km = ckP+at;
+		const unsigned char* code = seqs[q]->codes;
+		const int len = seqs[q]->length;
+		for (int p=0;p<len;p++) {
+			if (km[p] >= buckets) continue;
+			unsigned int v = (unsigned int)(at+p);
+			if (c->flanks) {
+				// 2 bits a base: an N (4) or past the sequence reads as A
+				const unsigned int l1 = (p > 0) ? (code[p-1] & 3) : 0;
+				const unsigned int l2 = (p > 1) ? (code[p-2] & 3) : 0;
+				const unsigned int r1 = (p+P < len) ? (code[p+P] & 3) : 0;
+				const unsigned int r2 = (p+P+1 < len) ? (code[p+P+1] & 3) : 0;
+				const unsigned int r3 = (p+P+2 < len) ? (code[p+P+2] & 3) : 0;
+				v |= ((l1 | (l2 << 2)) << 22) | ((r1 | (r2 << 2) | (r3 << 4)) << 26);
+			}
+			c->pos[cursor[km[p]]++] = (int)v;
+		}
+	}
+	delete []cursor;
+	const long blocks = (span + 63) / 64;
+	c->blockSeq = new unsigned short[blocks > 0 ? blocks : 1];
+	int qs = 0;
+	for (long b=0;b<blocks;b++) {
+		while (qs+1 < c->count && c->cstart[qs+1] <= b*64) qs++;
+		c->blockSeq[b] = (unsigned short)qs;
+	}
+}
+
+// mask: each thread takes a fixed run of sequences and masks it with every
+// motif in file order, so each sequence sees the motifs in the order -p 1
+// gives it, whatever -p is. (Threads over motifs would mask one sequence
+// from several threads at once.) Sequences with a site are counted
+// afterwards in sequence order, as the -p 1 loop counts them.
+void SequenceArray::maskMotifs(Motif** motifs, int numMotifs, int strand, int offset, int threads) {
+	for (int k=0;k<numMotifs;k++) motifs[k]->logxform();
+	if (threads > numSeqs) threads = numSeqs;
+	if (threads < 1) threads = 1;
+	long total = 0;
+	for (int i=0;i<numSeqs;i++) total += seqs[i]->length;
+	std::vector<int> bounds(threads+1, numSeqs);
+	bounds[0] = 0;
+	long acc = 0;
+	int t = 1;
+	for (int i=0;i<numSeqs && t<threads;i++) {
+		acc += seqs[i]->length;
+		if (acc*threads >= total*t) bounds[t++] = i+1;
+	}
+	std::vector<std::vector<unsigned long long> > hit(threads);
+	parallelFor(threads, threads, [&](int r) {
+		const int lo = bounds[r];
+		const int hi = bounds[r+1];
+		const int words = (hi-lo+63)/64;
+		hit[r].assign((size_t)numMotifs*words, 0);
+		int* sitePositions = new int[longestSequence];
+		char* siteStrands = new char[longestSequence];
+		pthread_mutex_t notused;
+		pthread_mutex_init(&notused,NULL);
+		MotifScanTables* tables = new MotifScanTables();
+		for (int k=0;k<numMotifs;k++) {
+			tables->build(motifs[k]);
+			for (int i=lo;i<hi;i++) {
+				double score = 0;
+				int nsites = seqs[i]->motifScan(motifs[k],strand,offset,KNOWN_MASK_MOTIFS,score,
+							sitePositions,siteStrands,NULL,notused,tables);
+				if (nsites > 0) hit[r][(size_t)k*words + (i-lo)/64] |= 1ULL << ((i-lo)%64);
+			}
+		}
+		delete tables;
+		pthread_mutex_destroy(&notused);
+		delete []sitePositions;
+		delete []siteStrands;
+	});
+	for (int k=0;k<numMotifs;k++) {
+		Motif* m = motifs[k];
+		m->numTarget = 0.0;
+		m->numBackground = 0.0;
+		for (int r=0;r<threads;r++) {
+			const int words = (bounds[r+1]-bounds[r]+63)/64;
+			for (int i=bounds[r];i<bounds[r+1];i++) {
+				int j = i-bounds[r];
+				if (!((hit[r][(size_t)k*words + j/64] >> (j%64)) & 1ULL)) continue;
+				if (seqs[i]->g == 1) {
+					m->numTarget += seqs[i]->w;
+				} else {
+					m->numBackground += seqs[i]->w;
+				}
+			}
+		}
+		if (numTarget > 0.0) m->freqTarget = m->numTarget / numTarget;
+		if (numBackground > 0.0) m->freqBackground = m->numBackground / numBackground;
+	}
+}
+
+void SequenceArray::prepareKmers(int threads, int need5, int need6, int maxWidth, int need7) {
+	delete []chunks;
+	chunks = new KmerChunk[numSeqs > 0 ? numSeqs : 1];
+	numChunks = 0;
+	// About one chunk per thread, at least 16,384 bases and at most 2 Mb: a
+	// chunk's index has 4096 6-mer or 16,384 7-mer buckets, and each passing
+	// k-mer costs a bucket lookup per chunk, so few large chunks visit their
+	// entries with less overhead; past a few Mb its code arrays (2 bytes a
+	// base each) leave the cache that the index visit reads them from at
+	// random (1 Mb was best with the 6-mer index, 2 Mb with the 7-mer one).
+	long totalBases = 0;
+	for (int q=0;q<numSeqs;q++) totalBases += (seqs[q]->length > 3) ? seqs[q]->length-3 : 0;
+	const int units = (threads > 0) ? threads : 1;
+	long chunkBases = (totalBases + units - 1) / units;
+	if (chunkBases < 16384) chunkBases = 16384;
+	if (chunkBases > 2097152) chunkBases = 2097152;
+	int i = 0;
+	while (i < numSeqs) {
+		int first = i;
+		long bases = 0;
+		while (i < numSeqs && i-first < 65535) {
+			long add = seqs[i]->length - 3;
+			if (add < 0) add = 0;
+			if (i > first && bases + add > chunkBases) break;
+			bases += add;
+			i++;
+		}
+		KmerChunk* c = &(chunks[numChunks++]);
+		c->first = first;
+		c->count = i-first;
+	}
+	index5 = need5;
+	delete []chunks6;
+	chunks6 = NULL;
+	delete []count6;
+	count6 = NULL;
+	delete []chunks7;
+	chunks7 = NULL;
+	delete []count7;
+	count7 = NULL;
+	if (need6) {
+		chunks6 = new KmerChunk[numChunks > 0 ? numChunks : 1];
+		for (int k=0;k<numChunks;k++) {
+			chunks6[k].first = chunks[k].first;
+			chunks6[k].count = chunks[k].count;
+		}
+	}
+	if (need7) {
+		chunks7 = new KmerChunk[numChunks > 0 ? numChunks : 1];
+		for (int k=0;k<numChunks;k++) {
+			chunks7[k].first = chunks[k].first;
+			chunks7[k].count = chunks[k].count;
+		}
+	}
+	// a chunk's sequences, then its indexes, on one thread
+	parallelFor(numChunks, threads, [&](int k) {
+		// the chunk's sequences' codes, in one block it owns
+		long codeBytes = 0;
+		for (int q=chunks[k].first;q<chunks[k].first+chunks[k].count;q++) codeBytes += seqs[q]->length + 1;
+		chunks[k].codesBlock = chunkArray<unsigned char>(codeBytes);
+		long codeAt = 0;
+		for (int q=chunks[k].first;q<chunks[k].first+chunks[k].count;q++) {
+			seqs[q]->prepareKmers(need5, chunks[k].codesBlock + codeAt);
+			codeAt += seqs[q]->length + 1;
+		}
+		if (need5) buildKmerChunk(seqs, &(chunks[k]));
+		if (need6) buildKmerChunkP(seqs, &(chunks6[k]), maxWidth+8, 6);
+		if (need7) buildKmerChunkP(seqs, &(chunks7[k]), maxWidth+8, 7);
+	});
+	// maxChunk6Entries: the most entries in one chunk of either index
+	maxChunk6Entries = 0;
+	if (need6) {
+		count6 = new int[4096];
+		for (int x=0;x<4096;x++) count6[x] = 0;
+		for (int k=0;k<numChunks;k++) {
+			for (int x=0;x<4096;x++) count6[x] += chunks6[k].start[x+1] - chunks6[k].start[x];
+			if (chunks6[k].start[4096] > maxChunk6Entries) maxChunk6Entries = chunks6[k].start[4096];
+		}
+	}
+	if (need7) {
+		count7 = new int[16384];
+		for (int x=0;x<16384;x++) count7[x] = 0;
+		for (int k=0;k<numChunks;k++) {
+			for (int x=0;x<16384;x++) count7[x] += chunks7[k].start[x+1] - chunks7[k].start[x];
+			if (chunks7[k].start[16384] > maxChunk6Entries) maxChunk6Entries = chunks7[k].start[16384];
+		}
+	}
+}
+
+// find with the index: sum the given candidate windows exactly, in the order
+// Sequence::motifScan's find path visits them (forward ascending, reverse
+// descending; both lists arrive ascending), with the same per-window logic.
+int Sequence::scanCandidates(Motif* motif, int strand, int offset, double &bestScore,
+					int* sitePositions, char* siteStrands, FILE* fp,
+					const MotifScanTables* tables, const int* fwdCand, int nf,
+					const int* revCand, int nr) {
+	if (offset == MOTIF_OFFSET_NULL) {
+		offset = length/-2;
+	}
+	const unsigned char* code = codes;
+	const int mlen = tables->length;
+	const double* fwd = tables->fwd;
+	const double* rev = tables->rev;
+	bestScore = -1e10;
+	int numSites = 0;
+	if (strand == MOTIF_STRAND_POS || strand==MOTIF_STRAND_BOTH) {
+		for (int ci=0;ci<nf;ci++) {
+			const int i = fwdCand[ci];
+			const unsigned char* c = code+i;
+			double score = 0.0;
+			for (int j=0;j<mlen;j++) {
+				score += fwd[j*5+c[j]];
+			}
+			if (score == -INFINITY) continue;
+			if (score > bestScore) bestScore = score;
+			if (score >= motif->threshold) {
+				sitePositions[numSites] = i+offset;
+				siteStrands[numSites] = MOTIF_STRAND_POS;
+				numSites++;
+				scanOutSite(fp,name,i+offset,&(s[i]),motif->length,motif->name,'+',score);
+			}
+		}
+	}
+	if (strand == MOTIF_STRAND_BOTH || strand==MOTIF_STRAND_NEG) {
+		for (int ci=nr-1;ci>=0;ci--) {
+			const int i = revCand[ci];
+			const unsigned char* c = code+i;
+			double score = 0.0;
+			for (int j=0;j<mlen;j++) {
+				score += rev[j*5+c[-j]];
+			}
+			if (score == -INFINITY) continue;
+			if (score > bestScore) bestScore = score;
+			if (score >= motif->threshold) {
+				sitePositions[numSites] = i+offset;
+				siteStrands[numSites] = MOTIF_STRAND_NEG;
+				numSites++;
+				scanOutSite(fp,name,i+offset,&(s[i-motif->length+1]),motif->length,motif->name,'-',score);
+			}
+		}
+	}
+	return numSites;
+}
+
+// find with the index: the windows of chunk c that survive find's bound,
+// grouped by sequence. Visits only positions whose pivot-block 4-mer is in
+// the motif's pass list, then applies the bound expression of
+// Sequence::motifScan's find path unchanged. Fills, per sequence q of the
+// chunk, candidates [off[q], off[q+1]) of cand, ascending.
+static void orderCandidates(const long long* keys, int n, int count, int*& cand, int& candSize, int* off);
+static void collectCandidates(Sequence** seqs, const KmerChunk* c, const MotifScanTables* t,
+		int st, double cut, long long*& keys, int& keySize,
+		int*& cand, int& candSize, int* off) {
+	const int mlen = t->length;
+	const int a0 = t->blockStart[0];
+	const int a1 = t->blockStart[1];
+	const int len0 = t->blockLen[0];
+	const int len1 = t->blockLen[1];
+	const double blockRest = t->blockRest;
+	const double* T0 = (st == 0) ? t->bfwd : t->brev;
+	const double* T1 = T0 + 3125;
+	const int ap = t->blockStart[t->pivot[st]];
+	const int lenp = t->blockLen[t->pivot[st]];
+	int total = 0;
+	for (int k=0;k<t->npass[st];k++) {
+		int x = t->pass[st][k];
+		total += c->start[x+1] - c->start[x];
+	}
+	if (keySize < total+1) {
+		delete []keys;
+		keySize = total+1;
+		keys = new long long[keySize];
+	}
+	int n = 0;
+	for (int k=0;k<t->npass[st];k++) {
+		int x = t->pass[st][k];
+		for (int e=c->start[x];e<c->start[x+1];e++) {
+			int q = c->sid[e];
+			const Sequence* sq = seqs[c->first+q];
+			const unsigned short* km = sq->kmer5;
+			int i;
+			double bound;
+			if (st == 0) {
+				i = c->pos[e] - ap;
+				if (i < 0 || i > sq->length-mlen) continue;
+				bound = blockRest + T0[km[i+a0]] + T1[km[i+a1]];
+			} else {
+				i = c->pos[e] + ap + lenp - 1;
+				if (i < mlen-1 || i > sq->length-1) continue;
+				bound = blockRest + T0[km[i-a0-len0+1]] + T1[km[i-a1-len1+1]];
+			}
+			if (bound < cut) continue;
+			keys[n++] = ((long long)q << 32) | (long long)i;
+		}
+	}
+	orderCandidates(keys, n, c->count, cand, candSize, off);
+}
+
+// Candidates keys[0, n) as (sequence << 32 | position) into cand, grouped by
+// sequence q of the chunk's count, [off[q], off[q+1]), positions ascending.
+static void orderCandidates(const long long* keys, int n, int count, int*& cand, int& candSize, int* off) {
+	if (candSize < n+1) {
+		delete []cand;
+		candSize = n+1;
+		cand = new int[candSize];
+	}
+	// Order by (sequence, position): a counting sort by sequence, then an
+	// insertion sort of each sequence's positions when they are few.
+	for (int q=0;q<=count;q++) off[q] = 0;
+	for (int k=0;k<n;k++) off[(int)(keys[k] >> 32)+1]++;
+	for (int q=0;q<count;q++) off[q+1] += off[q];
+	static thread_local std::vector<int> fillv;
+	if ((int)fillv.size() < count+1) fillv.resize(count+1);
+	int* fill = fillv.data();
+	for (int q=0;q<count;q++) fill[q] = off[q];
+	for (int k=0;k<n;k++) {
+		cand[fill[(int)(keys[k] >> 32)]++] = (int)(keys[k] & 0xffffffffLL);
+	}
+	for (int q=0;q<count;q++) {
+		if (off[q+1]-off[q] > 32) {
+			// a long sequence: its candidates are many
+			std::sort(cand+off[q], cand+off[q+1]);
+			continue;
+		}
+		for (int a=off[q]+1;a<off[q+1];a++) {
+			int x = cand[a];
+			int b = a-1;
+			while (b >= off[q] && cand[b] > x) {
+				cand[b+1] = cand[b];
+				b--;
+			}
+			cand[b+1] = x;
+		}
+	}
+}
+
+// find with the 6/7-mer index: as collectCandidates, for buildSix's blocks.
+// Every entry of a passing pivot P-mer shares that P-mer's partial score, so
+// an entry costs a table lookup per other block (the second only when the
+// first, with the second's best, still reaches the cut). Forward, the window
+// starting at i holds the pivot P-mer at i+ap and another block's k-mer at
+// i+ao; reverse, the window ending at i holds them at i-ap-P+1 and
+// i-ao-k+1. Positions are in the chunk's end-to-end code arrays, whose
+// padding covers any motif width; an entry whose window leaves its sequence
+// reads a neighbour's or the padding's codes, and is dropped by the range
+// check once it passes the bound. O1, O2: the other blocks' kinds (0: none,
+// 5: up to 5 positions through ck5, 6 and 7 through ck6 and ck7).
+// The table slot of a block of kind O at code x: with the 7-mer
+// pivot every block reads ck7's prefix code.
+template <int P, int O>
+static inline unsigned int blockSlot(unsigned int x) {
+	if (P != 7) return x;
+	if (O == 7) return (x < 16384) ? x : 16384;
+	if (O == 6) return ((x >> 2) < 8192) ? (x >> 2) : 8192;
+	return x >> 4;
+}
+template <int P, int O1, int O2, int FL>
+static int gatherSix(Sequence** seqs, const KmerChunk* c, const MotifScanTables* t,
+		int st, double cut, long long* keys, int atMode) {
+	const int mlen = t->length;
+	const int p = t->s6pivot[st];
+	const int ap = t->s6Start[p];
+	const int b1 = t->s6oth[st][0];
+	const int b2 = t->s6oth[st][1];
+	const int a1 = (O1 != 0) ? t->s6Start[b1] : 0;
+	const int l1 = (O1 != 0) ? t->s6Len[b1] : 0;
+	const int a2 = (O2 != 0) ? t->s6Start[b2] : 0;
+	const int l2 = (O2 != 0) ? t->s6Len[b2] : 0;
+	const double* T1 = (O1 >= 6) ? t->t6[st][b1] : ((O1 == 5) ? ((P == 7) ? t->o5x[st][b1] : t->o5[st][b1]) : NULL);
+	const double* T2 = (O2 >= 6) ? t->t6[st][b2] : ((O2 == 5) ? ((P == 7) ? t->o5x[st][b2] : t->o5[st][b2]) : NULL);
+	const double max2 = (O2 != 0) ? t->s6max[st][b2] : 0.0;
+	const int pivotShift = (st == 0) ? -ap : ap+P-1;
+	const int shift1 = (st == 0) ? a1 : -a1-l1+1;
+	const int shift2 = (st == 0) ? a2 : -a2-l2+1;
+	const int lowI = (st == 0) ? 0 : mlen-1;
+	const int highLess = (st == 0) ? mlen : 1;
+	const int np = t->s6npass[st];
+	const int* px = t->s6pass[st];
+	const double* ps = t->s6passScore[st];
+	const unsigned short* ck1 = (P == 7 || O1 == 7) ? c->ck7 : ((O1 == 6) ? c->ck6 : c->ck5);
+	const unsigned short* ck2 = (P == 7 || O2 == 7) ? c->ck7 : ((O2 == 6) ? c->ck6 : c->ck5);
+	int n = 0;
+	if (FL) {
+		// Entries carry their flanking bases. In batches of up to FLAT
+		// entries: phase 1, branch-free, writes the entries whose flanks pass
+		// the flank test into a list on the stack (with their pass-list
+		// index); phase 2 runs the lookups over the list, prefetched a fixed
+		// distance ahead. A bucket may span batches.
+		enum { FLAT = 4096 };
+		int fp[FLAT];
+		unsigned short fk[FLAT];
+		const unsigned int* upos = (const unsigned int*)c->pos;
+		const double* gap = t->s6passGap[st];
+		const double* fL = t->s6flankL[st];
+		const double* fR = t->s6flankR[st];
+		int k = 0;
+		int e = (np > 0) ? c->start[px[0]] : 0;
+		while (k < np) {
+			int m = 0;
+			while (k < np && m < FLAT) {
+				const int eEnd = c->start[px[k]+1];
+				if (O1 == 0 && t->s6Rest + ps[k] < cut) {
+					e = eEnd;
+				} else {
+					// a later bucket's head (bucket starts are scattered)
+					if (k+4 < np) __builtin_prefetch(upos + c->start[px[k+4]]);
+					const double g = gap[k];
+					// m grows by at most one an entry, so FLAT - m entries fit
+					int lim = e + (FLAT - m);
+					if (lim > eEnd) lim = eEnd;
+					for (;e<lim;e++) {
+						const unsigned int u = upos[e];
+						fp[m] = (int)(u & 0x3FFFFFu);
+						fk[m] = (unsigned short)k;
+						m += (g + fL[(u >> 22) & 15] + fR[u >> 26] >= 0.0);
+					}
+				}
+				if (e == eEnd) {
+					k++;
+					if (k < np) e = c->start[px[k]];
+				}
+			}
+			for (int j=0;j<m;j++) {
+				const int ep = fp[j];
+				const int at = ep + pivotShift;
+				if (O1 != 0) {
+					if (j + 32 < m) {
+						__builtin_prefetch(ck1 + fp[j+32] + pivotShift + shift1);
+						// the second block's code, and the blockSeq slot a
+						// survivor reads
+						if (O2 != 0) __builtin_prefetch(ck2 + fp[j+32] + pivotShift + shift2);
+						if (!atMode) __builtin_prefetch(c->blockSeq + (fp[j+32] >> 6));
+					}
+					const double s1 = t->s6Rest + ps[fk[j]] + T1[blockSlot<P,O1>(ck1[at+shift1])];
+					if (O2 != 0) {
+						if (s1 + max2 < cut) continue;
+						if (s1 + T2[blockSlot<P,O2>(ck2[at+shift2])] < cut) continue;
+					} else if (s1 < cut) {
+						continue;
+					}
+				}
+				if (atMode) {
+					// the window's position in the chunk; resolveAts
+					// finds its sequence
+					((unsigned int*)keys)[n++] = (unsigned int)at;
+					continue;
+				}
+				int q = c->blockSeq[ep >> 6];
+				while (q+1 < c->count && c->cstart[q+1] <= ep) q++;
+				const int i = at - c->cstart[q];
+				if (i < lowI || i > c->clen[q] - highLess) continue;
+				keys[n++] = ((long long)q << 32) | (long long)i;
+			}
+		}
+		return n;
+	}
+	for (int k=0;k<np;k++) {
+		const double base = t->s6Rest + ps[k];
+		if (O1 == 0 && base < cut) continue;
+		const int x = px[k];
+		if (O1 != 0 && k+1 < np) {
+			// the next bucket's first entries: the in-bucket prefetch below
+			// reaches only entries 32 past the current one
+			const int nx = px[k+1];
+			const int nEnd = (c->start[nx+1] < c->start[nx]+32) ? c->start[nx+1] : c->start[nx]+32;
+			for (int j=c->start[nx];j<nEnd;j++) __builtin_prefetch(ck1 + c->pos[j] + pivotShift + shift1);
+		}
+		const int eEnd = c->start[x+1];
+		for (int e=c->start[x];e<eEnd;e++) {
+			const int at = c->pos[e] + pivotShift;
+			if (O1 != 0) {
+				// a bucket's entries step through the chunk's codes ~4 kB apart
+				if (e + 32 < eEnd) __builtin_prefetch(ck1 + c->pos[e+32] + pivotShift + shift1);
+				const double s1 = base + T1[blockSlot<P,O1>(ck1[at+shift1])];
+				if (O2 != 0) {
+					if (s1 + max2 < cut) continue;
+					if (s1 + T2[blockSlot<P,O2>(ck2[at+shift2])] < cut) continue;
+				} else if (s1 < cut) {
+					continue;
+				}
+			}
+			// the entry's sequence: the last one starting at or before its
+			// position (zero-length sequences are stepped over)
+			const int ep = c->pos[e];
+			if (atMode) {
+				((unsigned int*)keys)[n++] = (unsigned int)at;
+				continue;
+			}
+			int q = c->blockSeq[ep >> 6];
+			while (q+1 < c->count && c->cstart[q+1] <= ep) q++;
+			const int i = at - c->cstart[q];
+			if (i < lowI || i > c->clen[q] - highLess) continue;
+			keys[n++] = ((long long)q << 32) | (long long)i;
+		}
+	}
+	return n;
+}
+static int blockKind(int len) {
+	if (len >= 7) return 7;
+	if (len == 6) return 6;
+	return 5;
+}
+// The keys gatherSix leaves for chunk c and strand st, unordered; keys holds
+// at least the chunk's index entries. With atMode, keys holds instead
+// 32-bit window positions in the chunk (start forward, end reverse), not
+// yet checked against their sequence's ends (resolveAts does).
+static int sixKeys(Sequence** seqs, const KmerChunk* c, const MotifScanTables* t,
+		int st, double cut, long long* keys, int atMode) {
+	const int k1 = (t->s6n >= 2) ? blockKind(t->s6Len[t->s6oth[st][0]]) : 0;
+	const int k2 = (t->s6n >= 3) ? blockKind(t->s6Len[t->s6oth[st][1]]) : 0;
+#define SIX_GATHER(PP, A, B) if (k1 == A && k2 == B) return c->flanks \
+		? gatherSix<PP,A,B,1>(seqs, c, t, st, cut, keys, atMode) : gatherSix<PP,A,B,0>(seqs, c, t, st, cut, keys, atMode);
+	if (t->sixP == 7) {
+		SIX_GATHER(7,0,0)
+		SIX_GATHER(7,5,0) SIX_GATHER(7,6,0) SIX_GATHER(7,7,0)
+		SIX_GATHER(7,5,5) SIX_GATHER(7,5,6) SIX_GATHER(7,5,7)
+		SIX_GATHER(7,6,5) SIX_GATHER(7,6,6) SIX_GATHER(7,6,7)
+		SIX_GATHER(7,7,5) SIX_GATHER(7,7,6) SIX_GATHER(7,7,7)
+	} else {
+		SIX_GATHER(6,0,0)
+		SIX_GATHER(6,5,0) SIX_GATHER(6,6,0) SIX_GATHER(6,7,0)
+		SIX_GATHER(6,5,5) SIX_GATHER(6,5,6) SIX_GATHER(6,6,5) SIX_GATHER(6,6,6)
+	}
+#undef SIX_GATHER
+	fprintf(stderr, "!!! no index path for blocks %d %d !!!\n", k1, k2);
+	exit(1);
+	return 0;
+}
+static int sixKeys(Sequence** seqs, const KmerChunk* c, const MotifScanTables* t,
+		int st, double cut, long long* keys, int atMode);
+// Window positions from sixKeys' atMode (n of them, in ats), sorted,
+// then each turned into its chunk sequence (seq) and window position (pos),
+// keeping only windows inside their sequence: the sequence is the last one
+// starting at or before the position, found walking forward. Returns how
+// many were kept.
+// ats[0, n) ascending by an LSD radix sort, 8 bits a pass.
+static void radixSortU32(unsigned int* ats, int n) {
+	static thread_local std::vector<unsigned int> tmpv;
+	if ((int)tmpv.size() < n) tmpv.resize(n);
+	unsigned int* tmp = tmpv.data();
+	unsigned int hi = 0;
+	for (int k=0;k<n;k++) hi |= ats[k];
+	const int passes = (hi < (1u << 24)) ? 3 : 4;
+	unsigned int* src = ats;
+	unsigned int* dst = tmp;
+	for (int pass=0;pass<passes;pass++) {
+		const int shift = 8*pass;
+		int count[257];
+		for (int b=0;b<257;b++) count[b] = 0;
+		for (int k=0;k<n;k++) count[((src[k] >> shift) & 255)+1]++;
+		for (int b=0;b<256;b++) count[b+1] += count[b];
+		for (int k=0;k<n;k++) dst[count[(src[k] >> shift) & 255]++] = src[k];
+		unsigned int* t = src;
+		src = dst;
+		dst = t;
+	}
+	if (src != ats) memcpy(ats, src, (size_t)n*sizeof(unsigned int));
+}
+static int resolveAts(const KmerChunk* c, int st, int mlen, unsigned int* ats, int n,
+		int* seq, int* pos) {
+	if (n > 64) {
+		radixSortU32(ats, n);
+	} else {
+		for (int a=1;a<n;a++) {
+			unsigned int x = ats[a];
+			int b = a-1;
+			while (b >= 0 && ats[b] > x) {
+				ats[b+1] = ats[b];
+				b--;
+			}
+			ats[b+1] = x;
+		}
+	}
+	const int lowI = (st == 0) ? 0 : mlen-1;
+	const int highLess = (st == 0) ? mlen : 1;
+	int q = 0;
+	int m = 0;
+	for (int k=0;k<n;k++) {
+		const int at = (int)ats[k];
+		const int b = c->blockSeq[at >> 6];
+		if (b > q) q = b;
+		while (q+1 < c->count && c->cstart[q+1] <= at) q++;
+		const int i = at - c->cstart[q];
+		if (i < lowI || i > c->clen[q] - highLess) continue;
+		seq[m] = q;
+		pos[m] = i;
+		m++;
+	}
+	return m;
+}
+static void collectCandidates6(Sequence** seqs, const KmerChunk* c, const MotifScanTables* t,
+		int st, double cut, long long*& keys, int& keySize,
+		int*& cand, int& candSize, int* off) {
+	int total = 0;
+	for (int k=0;k<t->s6npass[st];k++) {
+		int x = t->s6pass[st][k];
+		total += c->start[x+1] - c->start[x];
+	}
+	if (keySize < total+1) {
+		delete []keys;
+		keySize = total+1;
+		keys = new long long[keySize];
+	}
+	int n = sixKeys(seqs, c, t, st, cut, keys, 0);
+	orderCandidates(keys, n, c->count, cand, candSize, off);
+}
+
 int Sequence::motifScan(Motif* motif, int strand,int offset, int mode,double &bestScore,
 										int* sitePositions, char* siteStrands,
-										FILE* fp, pthread_mutex_t fileLock) {
+										FILE* fp, pthread_mutex_t fileLock,
+										const MotifScanTables* tables) {
 
 	if (offset == MOTIF_OFFSET_NULL) {
 		offset = length/-2;
 	}
-	char* ss = new char[strlen(s)+1];
-	strcpy(ss,s);
+	// The sequence as table columns: prepared once for find, which never
+	// edits them; otherwise a per-thread copy (mask writes 4s into it).
+	static thread_local unsigned char* scratch = NULL;
+	static thread_local int scratchSize = 0;
+	unsigned char* code = codes;
+	if (code == NULL || mode != KNOWN_FIND_ALL || fp == NULL) {
+		if (scratchSize < length+1) {
+			delete []scratch;
+			scratchSize = length+1;
+			scratch = new unsigned char[scratchSize];
+		}
+		for (int i=0;i<length;i++) scratch[i] = motifScanCode[(unsigned char)s[i]];
+		code = scratch;
+	}
+
+	if (tables == NULL) {
+		static thread_local MotifScanTables* own = NULL;
+		if (own == NULL) own = new MotifScanTables();
+		own->build(motif);
+		tables = own;
+	}
+	const int mlen = tables->length;
+	const int K = tables->K;
+	const double restOfBest = tables->restOfBest;
+	const double* fwd = tables->fwd;
+	const double* rev = tables->rev;
+	const int* sel = tables->sel;
+
+	// Bound and score differ only by rounding (~1e-13 here), far inside the
+	// margin.
+	const int prune = (mode == KNOWN_FIND_ALL && fp != NULL) || mode == KNOWN_MASK_MOTIFS;
+	const double cut = motif->threshold - 1e-6;
+	// find with prepared 4-mers bounds by two block lookups (the fast path
+	// below); mask, which rewrites the sequence as it goes, by the 4 ranked
+	// positions in the general loops.
+	const int useBlocks = prune && mode == KNOWN_FIND_ALL && kmer5 != NULL && tables->nblocks > 0;
+	const unsigned short* km = kmer5;
+	const double blockRest = tables->blockRest;
+	const int a0 = tables->blockStart[0];
+	const int a1 = tables->blockStart[1];
+	const int len0 = tables->blockLen[0];
+	const int len1 = tables->blockLen[1];
+	const double* bf0 = tables->bfwd;
+	const double* bf1 = tables->bfwd+3125;
+	const double* br0 = tables->brev;
+	const double* br1 = tables->brev+3125;
 
 	bestScore = -1e10;
 	int numSites = 0;
+
+	if (useBlocks) {
+		// find's fast path: a branch-free pass bounds every window and keeps
+		// those that could reach the threshold; only they are summed, in the
+		// order the general loops below visit them.
+		static thread_local int* cand = NULL;
+		static thread_local int candSize = 0;
+		if (candSize < length+1) {
+			delete []cand;
+			candSize = length+1;
+			cand = new int[candSize];
+		}
+		if (strand == MOTIF_STRAND_POS || strand==MOTIF_STRAND_BOTH) {
+			const int n = length-mlen+1;
+			const unsigned short* k0 = km+a0;
+			const unsigned short* k1 = km+a1;
+			int nc = 0;
+			for (int i=0;i<n;i++) {
+				double bound = blockRest + bf0[k0[i]] + bf1[k1[i]];
+				cand[nc] = i;
+				nc += !(bound < cut);
+			}
+			for (int ci=0;ci<nc;ci++) {
+				const int i = cand[ci];
+				const unsigned char* c = code+i;
+				double score = 0.0;
+				for (int j=0;j<mlen;j++) {
+					score += fwd[j*5+c[j]];
+				}
+				if (score == -INFINITY) continue;
+				if (score > bestScore) bestScore = score;
+				if (score >= motif->threshold) {
+					sitePositions[numSites] = i+offset;
+					siteStrands[numSites] = MOTIF_STRAND_POS;
+					numSites++;
+					scanOutSite(fp,name,i+offset,&(s[i]),motif->length,motif->name,'+',score);
+				}
+			}
+		}
+		if ((strand == MOTIF_STRAND_BOTH || strand==MOTIF_STRAND_NEG) && length >= mlen) {
+			// Windows end at i = mlen-1 .. length-1, and block q's 5-mer
+			// starts at i-a_q-len_q+1. Collected ascending, summed descending.
+			const int first = mlen-1;
+			const int n = length-first;
+			const unsigned short* k0 = km+first-a0-len0+1;
+			const unsigned short* k1 = km+first-a1-len1+1;
+			int nc = 0;
+			for (int t=0;t<n;t++) {
+				double bound = blockRest + br0[k0[t]] + br1[k1[t]];
+				cand[nc] = first+t;
+				nc += !(bound < cut);
+			}
+			for (int ci=nc-1;ci>=0;ci--) {
+				const int i = cand[ci];
+				const unsigned char* c = code+i;
+				double score = 0.0;
+				for (int j=0;j<mlen;j++) {
+					score += rev[j*5+c[-j]];
+				}
+				if (score == -INFINITY) continue;
+				if (score > bestScore) bestScore = score;
+				if (score >= motif->threshold) {
+					sitePositions[numSites] = i+offset;
+					siteStrands[numSites] = MOTIF_STRAND_NEG;
+					numSites++;
+					scanOutSite(fp,name,i+offset,&(s[i-motif->length+1]),motif->length,motif->name,'-',score);
+				}
+			}
+		}
+		return numSites;
+	}
+
 	if (strand == MOTIF_STRAND_POS || strand==MOTIF_STRAND_BOTH) {
 		int totalLength = length-(motif->length)+1;
 		for (int i=0;i<totalLength;i++) {
-			double score = 0.0; 
-			int bad = 0;
-			for (int j=0;j<motif->length;j++) {
-				switch(s[i+j]) {
-					case 'A':
-						score += motif->m[j][0];
-						break;
-					case 'C':
-						score += motif->m[j][1];
-						break;
-					case 'G':
-						score += motif->m[j][2];
-						break;
-					case 'T':
-						score += motif->m[j][3];
-						break;
-					default:
-						bad = 1;
-						break;
+			const unsigned char* c = code+i;
+			if (prune) {
+				double bound = restOfBest;
+				for (int t=0;t<K;t++) {
+					bound += fwd[sel[t]*5+c[sel[t]]];
 				}
-				if (bad) break;
+				if (bound < cut) continue;
 			}
-			if (bad) continue;
+			double score = 0.0;
+			for (int j=0;j<mlen;j++) {
+				score += fwd[j*5+c[j]];
+			}
+			if (score == -INFINITY) continue;
 			if (score > bestScore) {
 				bestScore = score;
 				if (mode == KNOWN_MSCORE_MOTIFS) {
@@ -3414,49 +5529,36 @@ int Sequence::motifScan(Motif* motif, int strand,int offset, int mode,double &be
 					break;
 				}
 				if (mode == KNOWN_MASK_MOTIFS) {
-					for (int j=0;j<motif->length;j++) s[i+j] = 'N';
+					for (int j=0;j<motif->length;j++) {
+						s[i+j] = 'N';
+						code[i+j] = 4;
+					}
 				} else if (mode == KNOWN_MSCORE_MOTIFS) {
 				} else if (fp != NULL) {
-					char tmp = ss[i+motif->length];
-					ss[i+motif->length] = '\0';
-					pthread_mutex_lock(&fileLock);
-					fprintf(fp,"%s\t%d\t%s\t%s\t+\t%.6lf\n",name,i+offset,&(ss[i]),motif->name,score);
-					pthread_mutex_unlock(&fileLock);
-					ss[i+motif->length] = tmp;
+					scanOutSite(fp,name,i+offset,&(s[i]),motif->length,motif->name,'+',score);
 				}
 			}
 		}
 	}
 	if (mode == KNOWN_JUST_SCORE_ZOOPS && numSites > 0) {
-		delete []ss;
 		return 1;
 	}
 
 	if (strand == MOTIF_STRAND_BOTH || strand==MOTIF_STRAND_NEG) {
 		for (int i=length-1;i>=motif->length-1;i--) {
-			double score = 0.0; 
-			int bad = 0;
-			for (int j=0;j<motif->length;j++) {
-				switch(s[i-j]) {
-					case 'A':
-						score += motif->m[j][3];
-						break;
-					case 'C':
-						score += motif->m[j][2];
-						break;
-					case 'G':
-						score += motif->m[j][1];
-						break;
-					case 'T':
-						score += motif->m[j][0];
-						break;
-					default:
-						bad = 1;
-						break;
+			const unsigned char* c = code+i;
+			if (prune) {
+				double bound = restOfBest;
+				for (int t=0;t<K;t++) {
+					bound += rev[sel[t]*5+c[-sel[t]]];
 				}
-				if (bad) break;
+				if (bound < cut) continue;
 			}
-			if (bad) continue;
+			double score = 0.0;
+			for (int j=0;j<mlen;j++) {
+				score += rev[j*5+c[-j]];
+			}
+			if (score == -INFINITY) continue;
 			if (score > bestScore) {
 				bestScore = score;
 				if (mode == KNOWN_MSCORE_MOTIFS) {
@@ -3473,20 +5575,17 @@ int Sequence::motifScan(Motif* motif, int strand,int offset, int mode,double &be
 					break;
 				}
 				if (mode == KNOWN_MASK_MOTIFS) {
-					for (int j=0;j<motif->length;j++) s[i-j] = 'N';
+					for (int j=0;j<motif->length;j++) {
+						s[i-j] = 'N';
+						code[i-j] = 4;
+					}
 				} else if (mode == KNOWN_MSCORE_MOTIFS) {
 				} else if (fp != NULL) {
-					char tmp = ss[i+1];
-					ss[i+1] = '\0';
-					pthread_mutex_lock(&fileLock);
-					fprintf(fp,"%s\t%d\t%s\t%s\t-\t%.6lf\n",name,i+offset,&(ss[i-motif->length+1]),motif->name,score);
-					pthread_mutex_unlock(&fileLock);
-					ss[i+1] = tmp;
+					scanOutSite(fp,name,i+offset,&(s[i-motif->length+1]),motif->length,motif->name,'-',score);
 				}
 			}
 		}
 	}
-	delete []ss;
 	return numSites;
 }
 
@@ -3514,14 +5613,47 @@ SequenceArray::SequenceArray() {
 	scorer = NULL;
 	maxBackgroundPercent = MOTIF_MAX_BACKGROUND_PERCENT;
 	maxAutoNormIters = MAX_OLIGO_NORMALIZATION_ITERATIONS;
+	chunks = NULL;
+	numChunks = 0;
+	index5 = 0;
+	chunks6 = NULL;
+	count6 = NULL;
+	chunks7 = NULL;
+	count7 = NULL;
+	maxChunk6Entries = 0;
+	seqStatsUnread = 0;
+	textBlocks = NULL;
+	numTextBlocks = 0;
+	objBlocks = NULL;
+	objCounts = NULL;
+	numObjBlocks = 0;
 }
 SequenceArray::~SequenceArray() {
 	//if (link != NULL) delete link;
+	delete []chunks;
+	delete []chunks6;
+	delete []count6;
+	delete []chunks7;
+	delete []count7;
 	deleteLinks();
 	for (int i=0;i<numSeqs;i++) {
-		delete seqs[i];
+		// a Sequence built in an object block is destroyed in place
+		int inBlock = 0;
+		for (int b=0;b<numObjBlocks;b++) {
+			if (seqs[i] >= objBlocks[b] && seqs[i] < objBlocks[b]+objCounts[b]) inBlock = 1;
+		}
+		if (inBlock) {
+			seqs[i]->~Sequence();
+		} else {
+			delete seqs[i];
+		}
 	}
 	delete []seqs;
+	for (int i=0;i<numTextBlocks;i++) free(textBlocks[i]);
+	delete []textBlocks;
+	for (int i=0;i<numObjBlocks;i++) free(objBlocks[i]);
+	delete []objBlocks;
+	delete []objCounts;
 	if (scorer != NULL) delete scorer;
 }
 void SequenceArray::deleteLinks() {
@@ -3670,6 +5802,736 @@ void SequenceArray::parseFasta2SeqAndGroupFiles(char* inputFASTAfile,
 }
 
 
+// fgets(buf, MOTIF2_BUFFER, fp) over a block buffer: the same lines (at most
+// MOTIF2_BUFFER-1 bytes, ending after the first '\n' when there is one),
+// without a library call per line. A line stays valid until the next call.
+struct FastaLineReader {
+	FILE* fp;
+	std::vector<char> buf;
+	size_t start;
+	size_t end;
+	bool eof;
+	FastaLineReader(FILE* f) : fp(f), buf((size_t)1 << 20), start(0), end(0), eof(false) {}
+	bool next(char*& line, size_t& len) {
+		const size_t most = MOTIF2_BUFFER-1;
+		while (1) {
+			size_t avail = end-start;
+			char* p = buf.data()+start;
+			char* nl = (char*)memchr(p, '\n', avail < most ? avail : most);
+			if (nl != NULL) {
+				len = nl-p+1;
+			} else if (avail >= most) {
+				len = most;
+			} else if (eof) {
+				if (avail == 0) return false;
+				len = avail;
+			} else {
+				if (start > 0) {
+					memmove(buf.data(), p, avail);
+					start = 0;
+					end = avail;
+				}
+				if (buf.size()-end < ((size_t)1 << 20)) buf.resize(end + ((size_t)1 << 20));
+				size_t got = fread(buf.data()+end, 1, buf.size()-end, fp);
+				if (got == 0) eof = true;
+				end += got;
+				continue;
+			}
+			line = p;
+			start += len;
+			return true;
+		}
+	}
+};
+struct FastaRecord {
+	std::string name;
+	std::string seq;
+	int g;
+};
+
+// -i/-b FASTA read in memory. The records, their names (duplicates renamed
+// name-2, name-3, ...), groups and the stderr lines are those of
+// parseFasta2SeqAndGroupFiles followed by readSequenceFiles. When no name or
+// sequence holds a tab or CR and no name repeats, the .seq/.group round trip
+// gives each record its own name, sequence, group and weight 1.0, so the
+// Sequences are built directly; otherwise the lines that round trip would
+// write are parsed with readSequenceFiles' code, as before.
+static void copyCleaned(char* dst, const char* src, size_t n);
+void Sequence::setSeqCleaned(const char* n, size_t nameLen, const char* seq, size_t seqLen,
+		int group, double weight) {
+	if (textShared) {
+		s = NULL;
+		name = NULL;
+		textShared = 0;
+	}
+	if (name != NULL) delete []name;
+	name = new char[nameLen+1];
+	memcpy(name, n, nameLen);
+	name[nameLen] = '\0';
+	w = weight;
+	g = group;
+	if (kmer5 != NULL) delete []kmer5;
+	kmer5 = NULL;
+	if (kmer6 != NULL) delete []kmer6;
+	kmer6 = NULL;
+	if (codes != NULL && !codesShared) delete []codes;
+	codes = NULL;
+	codesShared = 0;
+	if (s != NULL) delete []s;
+	length = (int)seqLen;
+	s = new char[seqLen+1];
+	copyCleaned(s, seq, seqLen);
+	s[seqLen] = '\0';
+}
+void Sequence::setSeqCleanedAt(const char* n, size_t nameLen, const char* seq, size_t seqLen,
+		int group, double weight, char* at) {
+	if (textShared) {
+		s = NULL;
+		name = NULL;
+	}
+	if (name != NULL) delete []name;
+	if (s != NULL) delete []s;
+	w = weight;
+	g = group;
+	if (kmer5 != NULL) delete []kmer5;
+	kmer5 = NULL;
+	if (kmer6 != NULL) delete []kmer6;
+	kmer6 = NULL;
+	if (codes != NULL && !codesShared) delete []codes;
+	codes = NULL;
+	codesShared = 0;
+	name = at;
+	memcpy(name, n, nameLen);
+	name[nameLen] = '\0';
+	length = (int)seqLen;
+	s = at + nameLen + 1;
+	copyCleaned(s, seq, seqLen);
+	s[seqLen] = '\0';
+	textShared = 1;
+}
+
+// One piece of a FASTA file in memory, starting at a header line or at the
+// file's start: per header, its raw name and the kept bytes of the lines
+// after it (as the serial reader keeps them: the last byte dropped, and a CR
+// before it), back to back in `text`; lines before the first header form an
+// entry with no header. ok is 0 when a line is longer than fgets(buf,
+// MOTIF2_BUFFER) returns whole; tabOrCr when a kept byte is a tab or CR.
+struct FastaSpan {
+	size_t nameAt;
+	size_t nameLen;
+	size_t seqAt;
+	size_t seqLen;
+	int header;
+	// FNV-1a of the raw name (never 0), for the renaming table
+	unsigned long long nameHash;
+};
+static unsigned long long fastaNameHash(const char* p, size_t n) {
+	unsigned long long h = 1469598103934665603ULL;
+	for (size_t i=0;i<n;i++) {
+		h ^= (unsigned char)p[i];
+		h *= 1099511628211ULL;
+	}
+	return (h == 0) ? 1 : h;
+}
+// Raw name -> times seen, for renaming: open addressing on the parse's
+// hashes; keys are views of the pieces' text, which outlive the table.
+struct FastaNameTable {
+	std::vector<unsigned long long> hashes;
+	std::vector<std::string_view> keys;
+	std::vector<int> counts;
+	size_t used;
+	FastaNameTable() : used(0) {
+		hashes.assign(1024, 0);
+		keys.resize(1024);
+		counts.assign(1024, 0);
+	}
+	// room for more names without growing
+	void reserve(size_t more) {
+		size_t want = hashes.size();
+		while (2*(used+more) > want) want *= 2;
+		if (want != hashes.size()) growTo(want);
+	}
+	// The slot of name (hash h): found, or empty and claimed for it.
+	size_t slot(unsigned long long h, std::string_view name, int& found) {
+		if (2*(used+1) > hashes.size()) grow();
+		const size_t mask = hashes.size()-1;
+		size_t i = (size_t)h & mask;
+		while (hashes[i] != 0) {
+			if (hashes[i] == h && keys[i] == name) {
+				found = 1;
+				return i;
+			}
+			i = (i+1) & mask;
+		}
+		hashes[i] = h;
+		keys[i] = name;
+		counts[i] = 0;
+		used++;
+		found = 0;
+		return i;
+	}
+	void grow() {
+		growTo(hashes.size()*2);
+	}
+	// rehashed into n slots (a power of two)
+	void growTo(size_t n) {
+		std::vector<unsigned long long> oh;
+		std::vector<std::string_view> ok;
+		std::vector<int> oc;
+		oh.swap(hashes);
+		ok.swap(keys);
+		oc.swap(counts);
+		hashes.assign(n, 0);
+		keys.resize(n);
+		counts.assign(n, 0);
+		const size_t mask = hashes.size()-1;
+		for (size_t j=0;j<oh.size();j++) {
+			if (oh[j] == 0) continue;
+			size_t i = (size_t)oh[j] & mask;
+			while (hashes[i] != 0) i = (i+1) & mask;
+			hashes[i] = oh[j];
+			keys[i] = ok[j];
+			counts[i] = oc[j];
+		}
+	}
+};
+// A FASTA file's bytes.
+struct FastaFileBuffer {
+	char* data;
+	size_t size;
+	FastaFileBuffer() : data(NULL), size(0) {}
+	~FastaFileBuffer() {
+		free(data);
+	}
+	FastaFileBuffer(const FastaFileBuffer&) = delete;
+	FastaFileBuffer& operator=(const FastaFileBuffer&) = delete;
+	FastaFileBuffer(FastaFileBuffer&& o) : data(o.data), size(o.size) {
+		o.data = NULL;
+		o.size = 0;
+	}
+};
+template <typename F>
+static void parallelFor(int n, int threads, F fn);
+// A regular file, read with one pread per thread into memory nothing
+// initializes first (so the copies and the page faults run in parallel).
+// Returns 0, reading nothing, when the file is not regular or not the size
+// fstat gave.
+static int readFileParallel(FILE* fp, FastaFileBuffer& out, int threads) {
+	const int fd = fileno(fp);
+	struct stat st;
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) return 0;
+	const size_t size = (size_t)st.st_size;
+	char* buf = chunkArray<char>((long)size);
+	const int parts = (threads > 1) ? threads : 1;
+	std::atomic<int> bad(0);
+	parallelFor(parts, threads, [&](int t) {
+		size_t lo = size*(size_t)t/parts;
+		const size_t hi = size*(size_t)(t+1)/parts;
+		while (lo < hi) {
+			const ssize_t r = pread(fd, buf+lo, hi-lo, (off_t)lo);
+			if (r < 0 && errno == EINTR) continue;
+			if (r <= 0) {
+				bad = 1;
+				return;
+			}
+			lo += (size_t)r;
+		}
+	});
+	char extra = 0;
+	if (!bad && pread(fd, &extra, 1, (off_t)size) != 0) bad = 1;
+	if (bad) {
+		free(buf);
+		return 0;
+	}
+	out.data = buf;
+	out.size = size;
+	return 1;
+}
+struct FastaPiece {
+	std::vector<char, HugeAllocator<char> > text;
+	std::vector<FastaSpan> spans;
+	int ok;
+	int tabOrCr;
+};
+static void parseFastaPiece(const char* p, const char* end, FastaPiece& out) {
+	const size_t most = MOTIF2_BUFFER-1;
+	out.text.clear();
+	out.spans.clear();
+	// room for a record every 32 bytes (reserved, not touched)
+	out.spans.reserve((size_t)(end-p)/32 + 16);
+	out.ok = 1;
+	out.tabOrCr = 0;
+	out.text.reserve(end-p);
+	while (p < end) {
+		const char* nl = (const char*)memchr(p, '\n', end-p);
+		size_t len = (nl != NULL) ? (size_t)(nl-p+1) : (size_t)(end-p);
+		if (len > most) {
+			out.ok = 0;
+			return;
+		}
+		size_t keep = len-1;
+		if (len > 1 && p[len-2] == 13) keep = len-2;
+		if (memchr(p, '\t', keep) != NULL || memchr(p, '\r', keep) != NULL) out.tabOrCr = 1;
+		if (keep > 0 && p[0] == '>') {
+			FastaSpan sp;
+			sp.nameAt = out.text.size();
+			sp.nameLen = keep-1;
+			sp.nameHash = fastaNameHash(p+1, keep-1);
+			out.text.insert(out.text.end(), p+1, p+keep);
+			sp.seqAt = out.text.size();
+			sp.seqLen = 0;
+			sp.header = 1;
+			out.spans.push_back(sp);
+		} else {
+			if (out.spans.empty()) {
+				FastaSpan sp = {out.text.size(), 0, out.text.size(), 0, 0, 1};
+				out.spans.push_back(sp);
+			}
+			out.text.insert(out.text.end(), p, p+keep);
+			out.spans.back().seqLen += keep;
+		}
+		p += len;
+	}
+}
+
+// A record to build: its final name (a view of a piece's text, or
+// renamed[renamedAt] when it got a -N suffix), its kept sequence bytes, its
+// group.
+struct FastaKept {
+	const char* name;
+	size_t nameLen;
+	const char* seq;
+	size_t seqLen;
+	int g;
+	long renamedAt;
+};
+
+// Splits base[0, n) at header lines into pieces, parses them on `threads`
+// threads and appends the kept records in file order. names has one table
+// per thread, for the names whose hash falls in its partition. Returns 0
+// when the serial reader must take every file instead.
+static int readFastaPiecesParallel(const char* base, size_t n, int g, int threads,
+		std::vector<FastaPiece>& pieces, std::vector<FastaNameTable>& names,
+		std::vector<std::string>& renamed, std::vector<FastaKept>& kept, int& anyRenamed,
+		int& tabOrCr) {
+	if (n > 0 && memchr(base, '\0', n) != NULL) return 0;
+	const int count = (threads > 1 ? threads : 1) * 4;
+	std::vector<size_t> starts(count+1, n);
+	starts[0] = 0;
+	for (int t=1;t<count;t++) {
+		size_t at = n*(size_t)t/count;
+		if (at < starts[t-1]) at = starts[t-1];
+		size_t s = n;
+		if (at > 0) {
+			const char* q = base+at-1;
+			while (1) {
+				q = (const char*)memchr(q, '\n', base+n-q);
+				if (q == NULL || q+1 >= base+n) break;
+				if (q[1] == '>') {
+					s = q+1-base;
+					break;
+				}
+				q++;
+			}
+		}
+		starts[t] = s;
+	}
+	const size_t first = pieces.size();
+	pieces.resize(first + count);
+	parallelFor(count, threads, [&](int t) {
+		FastaPiece& pc = pieces[first+t];
+		parseFastaPiece(base+starts[t], base+starts[t+1], pc);
+		// a later piece starts at a header line, unless the line is a bare
+		// '>' at the end of the file, which keeps nothing
+		if (pc.ok && t > 0 && !pc.spans.empty() && !pc.spans[0].header && pc.spans[0].seqLen > 0) pc.ok = 0;
+	});
+	for (int t=0;t<count;t++) {
+		if (!pieces[first+t].ok) return 0;
+		if (pieces[first+t].tabOrCr) tabOrCr = 1;
+	}
+
+	// Each header's count of its name so far, the count the serial
+	// reader's table reaches there: a name's headers all fall in one hash
+	// partition, and each thread takes its partition's headers in file
+	// order (the tables carry over to the next file).
+	const int parts = (int)names.size();
+	std::vector<std::vector<int> > seen(count);
+	std::vector<size_t> perPart(parts, 0);
+	for (int t=0;t<count;t++) {
+		const FastaPiece& pc = pieces[first+t];
+		seen[t].assign(pc.spans.size(), 0);
+		for (size_t k=0;k<pc.spans.size();k++) {
+			if (pc.spans[k].header) perPart[(pc.spans[k].nameHash >> 40) % parts]++;
+		}
+	}
+	parallelFor(parts, threads, [&](int part) {
+		FastaNameTable& table = names[part];
+		table.reserve(perPart[part]);
+		for (int t=0;t<count;t++) {
+			const FastaPiece& pc = pieces[first+t];
+			for (size_t k=0;k<pc.spans.size();k++) {
+				const FastaSpan& sp = pc.spans[k];
+				if (!sp.header || (int)((sp.nameHash >> 40) % parts) != part) continue;
+				std::string_view raw(pc.text.data()+sp.nameAt, sp.nameLen);
+				int found = 0;
+				const size_t at = table.slot(sp.nameHash, raw, found);
+				seen[t][k] = found ? ++(table.counts[at]) : (table.counts[at] = 1);
+			}
+		}
+	});
+
+	{
+		size_t headers = 0;
+		for (int part=0;part<parts;part++) headers += perPart[part];
+		kept.reserve(kept.size() + headers);
+	}
+	// The serial reader's order: a header renames its name whether or not its
+	// record is kept; a record is kept when its name and sequence are not empty.
+	FastaKept cur = {NULL, 0, NULL, 0, g, -1};
+	int curNamed = 0;
+	for (int t=0;t<count;t++) {
+		FastaPiece& pc = pieces[first+t];
+		for (size_t k=0;k<pc.spans.size();k++) {
+			const FastaSpan& sp = pc.spans[k];
+			if (!sp.header) continue;
+			if (curNamed && cur.nameLen > 0 && cur.seqLen > 0) kept.push_back(cur);
+			std::string_view raw(pc.text.data()+sp.nameAt, sp.nameLen);
+			if (seen[t][k] > 1) {
+				int c = seen[t][k];
+				char suffix[32];
+				sprintf(suffix, "-%d", c);
+				renamed.push_back(std::string(raw) + suffix);
+				anyRenamed = 1;
+				cur.name = NULL;
+				cur.nameLen = renamed.back().size();
+				cur.renamedAt = (long)renamed.size()-1;
+			} else {
+				cur.name = raw.data();
+				cur.nameLen = raw.size();
+				cur.renamedAt = -1;
+			}
+			cur.seq = pc.text.data()+sp.seqAt;
+			cur.seqLen = sp.seqLen;
+			curNamed = 1;
+		}
+	}
+	if (curNamed && cur.nameLen > 0 && cur.seqLen > 0) kept.push_back(cur);
+	return 1;
+}
+
+void SequenceArray::readFastaDirect(char* inputFASTAfile, char* bgFASTAfile, int threads) {
+	// Each file whole, in memory, parsed in parallel; a file the parallel
+	// parse cannot take, or a tab or CR in a kept byte, sends every file
+	// through the serial reader below.
+	{
+		std::vector<FastaFileBuffer> files;
+		std::vector<FastaPiece> pieces;
+		std::vector<FastaNameTable> names((threads > 1) ? threads : 1);
+		std::vector<std::string> renamed;
+		std::vector<FastaKept> kept;
+		int anyRenamed = 0;
+		int tabOrCr = 0;
+		int ok = 1;
+		files.reserve(2);
+		for (int i=0;i<2 && ok;i++) {
+			if (i==0 && inputFASTAfile == NULL) continue;
+			if (i==1 && bgFASTAfile == NULL) continue;
+			FILE* fp = fopen(i == 0 ? inputFASTAfile : bgFASTAfile, "r");
+			if (fp == NULL) {
+				fprintf(stderr, "Could not open FASTA file %s !!!\n", i == 0 ? inputFASTAfile : bgFASTAfile);
+				exit(0);
+			}
+			files.push_back(FastaFileBuffer());
+			FastaFileBuffer& file = files.back();
+			if (!readFileParallel(fp, file, threads)) {
+				std::vector<char> data;
+				struct stat st;
+				size_t size = (size_t)1 << 20;
+				if (fstat(fileno(fp), &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) size = (size_t)st.st_size + 1;
+				data.resize(size);
+				size_t got = 0;
+				while (1) {
+					size_t r = fread(data.data()+got, 1, data.size()-got, fp);
+					got += r;
+					if (got < data.size()) break;
+					data.resize(data.size()*2);
+				}
+				file.data = chunkArray<char>((long)got);
+				if (got > 0) memcpy(file.data, data.data(), got);
+				file.size = got;
+			}
+			fclose(fp);
+			if (!readFastaPiecesParallel(file.data, file.size, i == 0 ? 1 : 0, threads, pieces, names, renamed,
+					kept, anyRenamed, tabOrCr)) ok = 0;
+		}
+		// renamed names live in `renamed`, which no longer grows
+		for (size_t k=0;k<kept.size() && ok;k++) {
+			if (kept[k].renamedAt >= 0) {
+				kept[k].name = renamed[kept[k].renamedAt].data();
+				kept[k].nameLen = renamed[kept[k].renamedAt].size();
+			}
+		}
+		// final names are distinct unless a rename happened (a renamed name
+		// can equal another record's)
+		if (ok && !tabOrCr && anyRenamed) {
+			std::unordered_set<std::string_view> seen;
+			seen.reserve(kept.size()*2);
+			for (size_t k=0;k<kept.size() && ok;k++) {
+				if (!seen.insert(std::string_view(kept[k].name, kept[k].nameLen)).second) ok = 0;
+			}
+		}
+		if (ok && !tabOrCr) {
+			fprintf(stderr, "\tReading input files...\n");
+			std::vector<Sequence*> built(kept.size(), (Sequence*)NULL);
+			// every record's name and sequence in one block on huge
+			// pages: the candidate walk reads them at random
+			std::vector<size_t> textAt(kept.size()+1, 0);
+			for (size_t k=0;k<kept.size();k++) textAt[k+1] = textAt[k] + kept[k].nameLen + 1 + kept[k].seqLen + 1;
+			char* text = chunkArray<char>((long)textAt[kept.size()]);
+			Sequence* objs = chunkArray<Sequence>((long)kept.size());
+			{
+				char** grown = new char*[numTextBlocks+1];
+				for (int i=0;i<numTextBlocks;i++) grown[i] = textBlocks[i];
+				grown[numTextBlocks++] = text;
+				delete []textBlocks;
+				textBlocks = grown;
+				Sequence** og = new Sequence*[numObjBlocks+1];
+				long* oc = new long[numObjBlocks+1];
+				for (int i=0;i<numObjBlocks;i++) {
+					og[i] = objBlocks[i];
+					oc[i] = objCounts[i];
+				}
+				og[numObjBlocks] = objs;
+				oc[numObjBlocks++] = (long)kept.size();
+				delete []objBlocks;
+				delete []objCounts;
+				objBlocks = og;
+				objCounts = oc;
+			}
+			const int blocks = (int)((kept.size() + 4095) / 4096);
+			parallelFor(blocks, threads, [&](int b) {
+				const size_t lo = (size_t)b*4096;
+				const size_t hi = (lo+4096 < kept.size()) ? lo+4096 : kept.size();
+				for (size_t k=lo;k<hi;k++) {
+					Sequence* s = new (objs + k) Sequence();
+					s->setSeqCleanedAt(kept[k].name, kept[k].nameLen, kept[k].seq, kept[k].seqLen,
+							kept[k].g, 1.0, text + textAt[k]);
+					built[k] = s;
+				}
+			});
+			int totalSequences = 0;
+			if (numSeqs == 0 && link == NULL) {
+				// the array optimizeArray would build from the list
+				// (newest first), with its sums in the same order, without
+				// one list node per sequence
+				const int n = (int)kept.size();
+				totalSequences = n;
+				seqs = new Sequence*[n > 0 ? n : 1];
+				numBackground = 0.0;
+				numTarget = 0.0;
+				bpTarget = 0;
+				bpBackground = 0;
+				longestSequence = 0;
+				for (int j=0;j<n;j++) {
+					Sequence* sq = built[n-1-j];
+					seqs[j] = sq;
+					sq->id = j;
+					if (sq->length > longestSequence) longestSequence = sq->length;
+					if (sq->g == 0) {
+						numBackground += sq->w;
+						bpBackground += sq->length;
+					} else {
+						numTarget += sq->w;
+						bpTarget += sq->length;
+					}
+				}
+				numSeqs = n;
+				longestSequence *= 2;
+				fprintf(stderr, "\t%d total sequences read\n", totalSequences);
+				return;
+			}
+			for (size_t k=0;k<kept.size();k++) {
+				totalSequences++;
+				addSequence(built[k]);
+			}
+			fprintf(stderr, "\t%d total sequences read\n", totalSequences);
+			optimizeArray();
+			return;
+		}
+	}
+
+	std::vector<FastaRecord> records;
+	std::unordered_map<std::string,int> names;
+	std::string curName;
+	std::string curSeq;
+
+	for (int i=0;i<2;i++) {
+
+		if (i==0 && inputFASTAfile == NULL) continue;
+		if (i==1 && bgFASTAfile == NULL) continue;
+
+		FILE* fp = NULL;
+		int g = 1;
+		if (i==0) {
+			fp = fopen(inputFASTAfile,"r");
+			if (fp == NULL) {
+				fprintf(stderr, "Could not open FASTA file %s !!!\n", inputFASTAfile);
+				exit(0);
+			}
+		} else {
+			fp = fopen(bgFASTAfile,"r");
+			if (fp == NULL) {
+				fprintf(stderr, "Could not open FASTA file %s !!!\n", bgFASTAfile);
+				exit(0);
+			}
+			g = 0;
+		}
+		curSeq.clear();
+		curName.clear();
+		FastaLineReader reader(fp);
+		char* line = NULL;
+		size_t len = 0;
+		while (reader.next(line, len)) {
+			// what strlen() and the two '\0' stores leave of the line
+			size_t lineLength = strnlen(line, len);
+			size_t keep = lineLength;
+			if (lineLength > 0) keep = lineLength-1;
+			if (lineLength > 1 && line[lineLength-2] == 13) keep = lineLength-2;
+
+			if (keep > 0 && line[0] == '>') {
+				if (!curSeq.empty() && !curName.empty()) {
+					records.push_back(FastaRecord());
+					records.back().name.swap(curName);
+					records.back().seq.swap(curSeq);
+					records.back().g = g;
+				}
+				curName.clear();
+				curSeq.clear();
+				if (lineLength > 1) {
+					curName.assign(line+1, keep-1);
+					std::unordered_map<std::string,int>::iterator it = names.find(curName);
+					if (it != names.end()) {
+						int c = ++(it->second);
+						char suffix[32];
+						sprintf(suffix, "-%d", c);
+						curName += suffix;
+					} else {
+						names[curName] = 1;
+					}
+				}
+			} else {
+				curSeq.append(line, keep);
+			}
+		}
+		if (!curSeq.empty() && !curName.empty()) {
+			records.push_back(FastaRecord());
+			records.back().name.swap(curName);
+			records.back().seq.swap(curSeq);
+			records.back().g = g;
+		}
+		fclose(fp);
+	}
+
+	int direct = 1;
+	{
+		std::unordered_set<std::string_view> seen;
+		seen.reserve(records.size()*2);
+		for (size_t k=0;k<records.size() && direct;k++) {
+			const std::string& n = records[k].name;
+			const std::string& q = records[k].seq;
+			if (memchr(n.data(), '\t', n.size()) != NULL || memchr(n.data(), '\r', n.size()) != NULL) direct = 0;
+			if (memchr(q.data(), '\t', q.size()) != NULL || memchr(q.data(), '\r', q.size()) != NULL) direct = 0;
+			if (!seen.insert(std::string_view(n)).second) direct = 0;
+		}
+	}
+	if (direct) {
+		fprintf(stderr, "\tReading input files...\n");
+		int totalSequences = 0;
+		for (size_t k=0;k<records.size();k++) {
+			char* seq = &(records[k].seq[0]);
+			cleanSequence(seq);
+			totalSequences++;
+			Sequence* s = new Sequence(&(records[k].name[0]),seq,records[k].g,1.0);
+			addSequence(s);
+		}
+		fprintf(stderr, "\t%d total sequences read\n", totalSequences);
+		optimizeArray();
+		return;
+	}
+
+	std::vector<std::string> groupLines;
+	std::vector<std::string> seqLines;
+	for (size_t k=0;k<records.size();k++) {
+		char groupTail[64];
+		sprintf(groupTail, "\t%d\t1.0\n", records[k].g);
+		groupLines.push_back(records[k].name + groupTail);
+		seqLines.push_back(records[k].name + "\t" + records[k].seq + "\n");
+	}
+	std::vector<FastaRecord>().swap(records);
+
+	// readSequenceFiles, over the lines instead of the files
+	Hashtable* groupdata = new Hashtable();
+
+	fprintf(stderr, "\tReading input files...\n");
+
+	char** cols = new char*[1000];
+	int numCols;
+	char* seq = NULL;
+	char* name = NULL;
+	std::vector<char> line;
+
+	for (size_t k=0;k<groupLines.size();k++) {
+		line.assign(groupLines[k].begin(), groupLines[k].end());
+		line.push_back('\0');
+		splitMotif2(&(line[0]),cols,numCols,'\t');
+		if (numCols < 2) continue;
+		GroupInfo* gi = new GroupInfo();
+		gi->weight = 1.0;
+		gi->group = 0;
+		name = cols[0];
+		if (numCols > 1) {
+			sscanf(cols[1],"%d",&(gi->group));
+		}
+		if (numCols > 2) {
+			sscanf(cols[2],"%lf",&(gi->weight));
+		}
+		groupdata->insert(gi, name);
+	}
+
+	int totalSequences = 0;
+	for (size_t k=0;k<seqLines.size();k++) {
+		line.assign(seqLines[k].begin(), seqLines[k].end());
+		line.push_back('\0');
+		splitMotif2(&(line[0]),cols,numCols,'\t');
+		if (numCols < 2) continue;
+		int group = 1;
+		double weight = 1.0;
+		GroupInfo* gi = (GroupInfo*)groupdata->search(cols[0]);
+		if (gi == NULL) continue;
+		group = gi->group;
+		weight = gi->weight;
+		name = cols[0];
+		seq = cols[1];
+		cleanSequence(seq);
+		totalSequences++;
+		Sequence* s = new Sequence(name,seq,group,weight);
+		addSequence(s);
+	}
+	fprintf(stderr, "\t%d total sequences read\n", totalSequences);
+
+	optimizeArray();
+
+	char** keys = groupdata->keys();
+	for (int i=0;i<groupdata->total;i++) {
+		GroupInfo* gi = (GroupInfo*)groupdata->search(keys[i]);
+		delete gi;
+		delete [](keys[i]);
+	}
+	delete []keys;
+	delete groupdata;
+	delete []cols;
+}
+
 void SequenceArray::readSequenceFiles(char* seqFile, char* groupFile) {
 
 	Hashtable* groupdata = new Hashtable();
@@ -3804,6 +6666,8 @@ void SequenceArray::maskMotifFromOligoArray(Motif* motif, OligoArray* oligos, ch
 	}
 	int mlen = motif->length;
 	int offset = 0;
+	MotifScanTables tables;
+	tables.build(motif);
 	double totalTsites = 0;
 	double totalBsites = 0;
 	pthread_mutex_t notused;
@@ -3812,7 +6676,7 @@ void SequenceArray::maskMotifFromOligoArray(Motif* motif, OligoArray* oligos, ch
 	for (int i=0;i<numSeqs;i++) {
 
 		int nsites = seqs[i]->motifScan(motif,strand,offset,KNOWN_FIND_ALL,score,
-								sitePositions,siteStrands,NULL,notused);
+								sitePositions,siteStrands,NULL,notused,&tables);
 		motif->seqStats[i].seq = seqs[i];
 		motif->seqStats[i].score = score;
 		motif->seqStats[i].setSites(sitePositions, siteStrands,nsites);
@@ -3903,6 +6767,8 @@ void SequenceArray::optimizeMotifThreshold(Motif* m, char strand) {
 	char *siteStrands = new char[longestSequence];
 	int mode = KNOWN_OPTIMIZE_THREASHOLD;
 	int offset = 0;
+	MotifScanTables tables;
+	tables.build(m);
 	pthread_mutex_t notused;
 	pthread_mutex_init(&notused,NULL);
 	pthread_mutex_unlock(&notused);
@@ -3910,7 +6776,7 @@ void SequenceArray::optimizeMotifThreshold(Motif* m, char strand) {
 		double score = 0;
 		//int nsites = 0;
 		(void)seqs[i]->motifScan(m,strand,offset,mode,score,sitePositions,
-											siteStrands,NULL,notused);
+											siteStrands,NULL,notused,&tables);
 		if (mode == KNOWN_OPTIMIZE_THREASHOLD || mode==KNOWN_FIND_ALL) {
 			m->seqStats[i].seq = seqs[i];
 			m->seqStats[i].score = score;
@@ -3923,19 +6789,179 @@ void SequenceArray::optimizeMotifThreshold(Motif* m, char strand) {
 
 void SequenceArray::motifScan(Motif* m, int strand,int offset, int mode,FILE* fp, pthread_mutex_t fileLock) {
 	m->logxform();
+	// find, width 6 and more, with the 6-mer index built: buildSix's blocks
+	// replace the 5-mer ones
+	int pivotP = 0;
+	if (mode == KNOWN_FIND_ALL && fp != NULL) {
+		if (chunks7 != NULL && m->length >= 7) pivotP = 7;
+		else if (chunks6 != NULL && m->length >= 6) pivotP = 6;
+	}
+	const int trySix = pivotP > 0;
+	const KmerChunk* chunksP = (pivotP == 7) ? chunks7 : chunks6;
+	MotifScanTables tables;
+	tables.build(m, !trySix);
+	const int six = trySix && tables.buildSix(m, pivotP, (pivotP == 7) ? count7 : count6);
 	m->numTarget = 0.0;
 	m->numBackground = 0.0;
 	int *sitePositions = new int[longestSequence];
 	char *siteStrands = new char[longestSequence];
-	if (mode == KNOWN_OPTIMIZE_THREASHOLD || mode==KNOWN_FIND_ALL) {
+	const int stats = mode == KNOWN_OPTIMIZE_THREASHOLD || (mode == KNOWN_FIND_ALL && !seqStatsUnread);
+	if (stats) {
 		m->initializeSeqStats(numSeqs);
 	}
+	// find with the prepared index visits only windows that can survive the
+	// bound, chunk by chunk; sequences are still handled in order.
+	const int indexed = six || (mode == KNOWN_FIND_ALL && fp != NULL && chunks != NULL && index5
+			&& tables.indexable);
+	static thread_local long long* keys = NULL;
+	static thread_local int keySize = 0;
+	static thread_local int* fcand = NULL;
+	static thread_local int fcandSize = 0;
+	static thread_local int* rcand = NULL;
+	static thread_local int rcandSize = 0;
+	static thread_local std::vector<int> foffv;
+	static thread_local std::vector<int> roffv;
+	if ((int)foffv.size() < numSeqs+1) {
+		foffv.resize(numSeqs+1);
+		roffv.resize(numSeqs+1);
+	}
+	int* foff = foffv.data();
+	int* roff = roffv.data();
+	int chunk = -1;
+	int chunkEnd = 0;
+	const double cut = m->threshold - 1e-6;
 	//fprintf(stderr, "numSeqs = %d, offset = %d\n", numSeqs,offset);
-	for (int i=0;i<numSeqs;i++) {
+	if (six && !stats) {
+		// Plain find: nothing is printed or kept for a sequence without
+		// candidates, so only those with some are visited, in sequence order,
+		// and numTarget/numBackground add up in the same order.
+		static thread_local long long* fkeys = NULL;
+		static thread_local long long* rkeys = NULL;
+		static thread_local int* fpos = NULL;
+		static thread_local int* rpos = NULL;
+		static thread_local int* fseq = NULL;
+		static thread_local int* rseq = NULL;
+		static thread_local int sixSize = 0;
+		if (sixSize < maxChunk6Entries+1) {
+			delete []fkeys;
+			delete []rkeys;
+			delete []fpos;
+			delete []rpos;
+			delete []fseq;
+			delete []rseq;
+			sixSize = maxChunk6Entries+1;
+			fkeys = new long long[sixSize];
+			rkeys = new long long[sixSize];
+			fpos = new int[sixSize];
+			rpos = new int[sixSize];
+			fseq = new int[sixSize];
+			rseq = new int[sixSize];
+		}
+		for (int ch=0;ch<numChunks;ch++) {
+			const KmerChunk* c = &(chunksP[ch]);
+			int nf = 0;
+			int nr = 0;
+			if (strand == MOTIF_STRAND_POS || strand==MOTIF_STRAND_BOTH) {
+				nf = sixKeys(seqs,c,&tables,0,cut,fkeys,1);
+			}
+			if (strand == MOTIF_STRAND_BOTH || strand==MOTIF_STRAND_NEG) {
+				nr = sixKeys(seqs,c,&tables,1,cut,rkeys,1);
+			}
+			if (nf == 0 && nr == 0) continue;
+			// window positions -> (sequence, position), ascending
+			nf = resolveAts(c, 0, m->length, (unsigned int*)fkeys, nf, fseq, fpos);
+			nr = resolveAts(c, 1, m->length, (unsigned int*)rkeys, nr, rseq, rpos);
+			if (nf == 0 && nr == 0) continue;
+			// the sequences with candidates, in order: (q, first forward, first reverse)
+			static thread_local std::vector<int> gq, ga, gb;
+			gq.clear();
+			ga.clear();
+			gb.clear();
+			{
+				int a = 0;
+				int b = 0;
+				while (a < nf || b < nr) {
+					const int qa = (a < nf) ? fseq[a] : INT_MAX;
+					const int qb = (b < nr) ? rseq[b] : INT_MAX;
+					const int q = (qa < qb) ? qa : qb;
+					gq.push_back(q);
+					ga.push_back(a);
+					gb.push_back(b);
+					while (a < nf && fseq[a] == q) a++;
+					while (b < nr && rseq[b] == q) b++;
+				}
+				ga.push_back(nf);
+				gb.push_back(nr);
+			}
+			const int ng = (int)gq.size();
+			const int mlen = m->length;
+			for (int g=0;g<ng;g++) {
+				// prefetch: the Sequence eight groups ahead, its data four ahead:
+				// the span of the group's windows, from the first one's
+				// start to the last one's end, in codes and text, and the name
+				// (which may cross a line)
+				if (g+8 < ng) __builtin_prefetch(seqs[c->first+gq[g+8]]);
+				if (g+4 < ng) {
+					const int gg = g+4;
+					const Sequence* p = seqs[c->first+gq[gg]];
+					int lo = (ga[gg] < ga[gg+1]) ? fpos[ga[gg]] : rpos[gb[gg]] - mlen + 1;
+					int hi = (gb[gg] < gb[gg+1]) ? rpos[gb[gg+1]-1] : fpos[ga[gg+1]-1] + mlen - 1;
+					if (lo < 0) lo = 0;
+					if (hi < lo) hi = lo;
+					__builtin_prefetch(p->codes + lo);
+					__builtin_prefetch(p->codes + hi);
+					__builtin_prefetch(p->s + lo);
+					__builtin_prefetch(p->s + hi);
+					__builtin_prefetch(p->name);
+					__builtin_prefetch(p->name + 32);
+				}
+				Sequence* sq = seqs[c->first+gq[g]];
+				double score = 0;
+				int nsites = sq->scanCandidates(m,strand,offset,score,sitePositions,siteStrands,fp,
+							&tables, fpos+ga[g], ga[g+1]-ga[g], rpos+gb[g], gb[g+1]-gb[g]);
+				if (nsites > 0) {
+					if (sq->g == 1) {
+						m->numTarget += sq->w;
+					} else {
+						m->numBackground += sq->w;
+					}
+				}
+			}
+		}
+	} else for (int i=0;i<numSeqs;i++) {
 		double score = 0;
 		int nsites = 0;
-		nsites = seqs[i]->motifScan(m,strand,offset,mode,score,sitePositions,
-													siteStrands,fp,fileLock);
+		if (indexed) {
+			if (i >= chunkEnd) {
+				chunk++;
+				const KmerChunk* c = six ? &(chunksP[chunk]) : &(chunks[chunk]);
+				chunkEnd = c->first + c->count;
+				for (int q=0;q<=c->count;q++) {
+					foff[q] = 0;
+					roff[q] = 0;
+				}
+				if (strand == MOTIF_STRAND_POS || strand==MOTIF_STRAND_BOTH) {
+					if (six) {
+						collectCandidates6(seqs,c,&tables,0,cut,keys,keySize,fcand,fcandSize,foff);
+					} else {
+						collectCandidates(seqs,c,&tables,0,cut,keys,keySize,fcand,fcandSize,foff);
+					}
+				}
+				if (strand == MOTIF_STRAND_BOTH || strand==MOTIF_STRAND_NEG) {
+					if (six) {
+						collectCandidates6(seqs,c,&tables,1,cut,keys,keySize,rcand,rcandSize,roff);
+					} else {
+						collectCandidates(seqs,c,&tables,1,cut,keys,keySize,rcand,rcandSize,roff);
+					}
+				}
+			}
+			int q = i - chunks[chunk].first;
+			nsites = seqs[i]->scanCandidates(m,strand,offset,score,sitePositions,siteStrands,fp,
+						&tables, fcand+foff[q], foff[q+1]-foff[q], rcand+roff[q], roff[q+1]-roff[q]);
+		} else {
+			nsites = seqs[i]->motifScan(m,strand,offset,mode,score,sitePositions,
+													siteStrands,fp,fileLock,&tables);
+		}
 		//fprintf(stderr, "%d\n", nsites);
 		if (nsites > 0) {
 			if (seqs[i]->g == 1) {
@@ -3944,26 +6970,24 @@ void SequenceArray::motifScan(Motif* m, int strand,int offset, int mode,FILE* fp
 				m->numBackground += seqs[i]->w;
 			}
 		}
-		if (mode == KNOWN_OPTIMIZE_THREASHOLD || mode==KNOWN_FIND_ALL) {
+		if (stats) {
 			m->seqStats[i].seq = seqs[i];
 			m->seqStats[i].score = score;
 			m->seqStats[i].setSites(sitePositions, siteStrands,nsites);
 		}
 		if (mode == KNOWN_MSCORE_MOTIFS) {
-			pthread_mutex_lock(&fileLock);
 			char curStrand = '+';
 			if (siteStrands[0] == MOTIF_STRAND_NEG) {
 				curStrand = '-';
 			}
-			fprintf(fp,"%s\t%d\t%s\t%s\t%c\t%.6lf\n",seqs[i]->name,sitePositions[0],m->consensus,m->name,
-												curStrand,score);
-			pthread_mutex_unlock(&fileLock);
+			scanOutSite(fp,seqs[i]->name,sitePositions[0],m->consensus,-1,m->name,curStrand,score);
 		}
 	}
+	scanOutFlush(fp);
 	if (numTarget > 0.0) m->freqTarget = m->numTarget / numTarget;
 	if (numBackground > 0.0) m->freqBackground = m->numBackground / numBackground;
 
-	if (mode == KNOWN_OPTIMIZE_THREASHOLD || mode==KNOWN_FIND_ALL) {
+	if (stats) {
 		m->calculateDistributionStats();
 		if (mode == KNOWN_OPTIMIZE_THREASHOLD) {
 			//m->deleteSites();
@@ -4354,37 +7378,36 @@ double SequenceArray::normalizeSequenceIteration(int nlen,int strand,char* normF
 
 }
 
+// ACGTN stay, acgt become ACGT, every other byte becomes N
+struct CleanSequenceTable {
+	char t[256];
+	CleanSequenceTable() {
+		for (int i=0;i<256;i++) t[i] = 'N';
+		t[(unsigned char)'A'] = 'A';
+		t[(unsigned char)'C'] = 'C';
+		t[(unsigned char)'G'] = 'G';
+		t[(unsigned char)'T'] = 'T';
+		t[(unsigned char)'a'] = 'A';
+		t[(unsigned char)'c'] = 'C';
+		t[(unsigned char)'g'] = 'G';
+		t[(unsigned char)'t'] = 'T';
+	}
+};
+static const CleanSequenceTable cleanSequenceTable;
+static void copyCleaned(char* dst, const char* src, size_t n) {
+	for (size_t i=0;i<n;i++) dst[i] = cleanSequenceTable.t[(unsigned char)src[i]];
+}
 void cleanSequence(char* seq) {
 	if (seq == NULL) return;
 	int len = strlen(seq);
 	for (int i=0;i<len;i++) {
-		switch(seq[i]) {
-			case 'A':
-			case 'C':
-			case 'G':
-			case 'T':
-			case 'N':
-				break;
-			case 'a':
-				seq[i] = 'A';
-				break;
-			case 'c':
-				seq[i] = 'C';
-				break;
-			case 'g':
-				seq[i] = 'G';
-				break;
-			case 't':
-				seq[i] = 'T';
-				break;
-			default:
-				seq[i] = 'N';
-		}
+		seq[i] = cleanSequenceTable.t[(unsigned char)seq[i]];
 	}
 }
 
 //=====================================================================
 KnownMotifs::KnownMotifs() {
+	directFasta = 0;
 	seqArray = new SequenceArray();
 	totalBp = 0;
 	normLength = 0;
@@ -4464,7 +7487,6 @@ void KnownMotifs::checkParameters() {
 	}
 }
 void KnownMotifs::parseFasta() {
-	SequenceArray* seqarray = new SequenceArray();
 	seqFile = new char[10000];
 	groupFile = new char[10000];
 	//srand(time(NULL));
@@ -4486,8 +7508,8 @@ void KnownMotifs::parseFasta() {
 		fptest = fopen(seqFile,"r");
 	}
 
-	seqarray->parseFasta2SeqAndGroupFiles(inputFASTAfile,bgFASTAfile,seqFile,groupFile);
-	delete seqarray;
+	// loadSequence reads the FASTA in memory; nothing is written here.
+	directFasta = 1;
 }
 
 
@@ -4498,7 +7520,11 @@ void KnownMotifs::loadMotifs() {
 void KnownMotifs::loadSequence() {
 
 	seqArray->maxAutoNormIters = maxAutoNormIters;
-	seqArray->readSequenceFiles(seqFile,groupFile);
+	if (directFasta) {
+		seqArray->readFastaDirect(inputFASTAfile,bgFASTAfile,(int)numCPUs);
+	} else {
+		seqArray->readSequenceFiles(seqFile,groupFile);
+	}
 	if (normLength > 0 && !findFlag) {
 		seqArray->normalizeSequence(normLength, strand, normFile,neutralFlag);
 	}
@@ -4538,10 +7564,59 @@ void KnownMotifs::getMotifEnrichment() {
 	//parallel check
 	pthread_mutex_init(&mutex, NULL);
 	pthread_mutex_init(&fileLock, NULL);
+	if (threasholdOptimizationFlag == KNOWN_FIND_ALL && sitefp != NULL) {
+		// the 6-mer index serves widths 6 and more, the 5-mer one widths 4-5
+		int need5 = 0;
+		int need6 = 0;
+		int need7 = 0;
+		int maxWidth = 0;
+		for (int k=0;k<numMotifs;k++) {
+			if (motifs[k]->length >= 7) need7 = 1;
+			else if (motifs[k]->length == 6) need6 = 1;
+			else if (motifs[k]->length >= 4) need5 = 1;
+			if (motifs[k]->length > maxWidth) maxWidth = motifs[k]->length;
+		}
+		seqArray->prepareKmers((int)numCPUs, need5, need6, maxWidth, need7);
+	}
+	// The stats are printed by -mout (Motif::print) and compared by
+	// -siteReduce (scoreOverlap); plain find prints neither.
+	seqArray->seqStatsUnread = findFlag && threasholdOptimizationFlag == KNOWN_FIND_ALL
+			&& siteReduceThreshold <= 0 && motifFilename == NULL;
 	mutexIndex = 0;
 	mutexTotal = numMotifs;
 	incMeter = 1.0/((double)numMotifs);
 	nextMeter = 0;
+
+	if (threasholdOptimizationFlag == KNOWN_MASK_MOTIFS) {
+		seqArray->maskMotifs(motifs, numMotifs, strand, offset, (int)numCPUs);
+		for (int i=0;i<numMotifs;i++) {
+			while (((double)i+1.0)/((double)numMotifs) >= nextMeter) {
+				fprintf(stderr, "=");
+				nextMeter += 1.0/80.0;
+			}
+			if (zoopsFlag == SCORER_APPROXIMATE_ZOOPS) {
+				motifs[i]->freqTarget = scorer->getZoopsApproxTarget(motifs[i]->numTarget)/seqArray->numTarget;
+				motifs[i]->freqBackground = scorer->getZoopsApproxBackground(motifs[i]->numBackground)
+																			/seqArray->numBackground;
+			}
+		}
+	} else {
+	OrderedOutput* ordered = NULL;
+	if (sitefp != NULL && (threasholdOptimizationFlag == KNOWN_FIND_ALL
+			|| threasholdOptimizationFlag == KNOWN_MSCORE_MOTIFS)) {
+		ordered = new OrderedOutput(sitefp, numMotifs);
+		orderedOut = ordered;
+		if (threasholdOptimizationFlag == KNOWN_FIND_ALL && seqArray->count7 != NULL) {
+			double c4[4] = {0.0, 0.0, 0.0, 0.0};
+			for (int x=0;x<16384;x++) c4[x >> 12] += seqArray->count7[x];
+			const double total = c4[0]+c4[1]+c4[2]+c4[3];
+			double comp[4];
+			for (int b=0;b<4;b++) comp[b] = (total > 0.0) ? c4[b]/total : 0.25;
+			std::vector<double> w(numMotifs, 0.0);
+			for (int k=0;k<numMotifs;k++) w[k] = motifScanCost(motifs[k], comp, total);
+			ordered->setWeights(w);
+		}
+	}
 
 	ThreadArgs_scanMotifThread** args = new ThreadArgs_scanMotifThread*[numCPUs];
 
@@ -4563,6 +7638,9 @@ void KnownMotifs::getMotifEnrichment() {
 	}
 	delete []thread;
 	delete []args;
+	orderedOut = NULL;
+	delete ordered;
+	}
 	pthread_mutex_destroy(&mutex);
 	pthread_mutex_destroy(&fileLock);
 
@@ -4595,21 +7673,34 @@ void KnownMotifs::scanMotifThread(ThreadArgs_scanMotifThread* args) {
 		pthread_mutex_unlock(&mutex);
 		if (i >= mutexTotal) break;
 
-
-		seqArray->motifScan(motifs[i],strand,offset,threasholdOptimizationFlag,sitefp,fileLock);
+		int k = i;
+		if (orderedOut != NULL) k = orderedOut->take();
+		Motif* motif = motifs[k];
+		if (orderedOut != NULL) orderedMotif = k;
+		seqArray->motifScan(motif,strand,offset,threasholdOptimizationFlag,sitefp,fileLock);
+		if (orderedOut != NULL) {
+			orderedOut->finish(k);
+			orderedMotif = -1;
+		}
+		// Plain find reads a motif's per-sequence stats only inside its own
+		// scan; free them so the next motif reuses the memory. -siteReduce
+		// compares them across motifs afterwards.
+		if (findFlag && threasholdOptimizationFlag == KNOWN_FIND_ALL && siteReduceThreshold <= 0) {
+			motif->deleteSeqStats();
+		}
 		if (zoopsFlag == SCORER_APPROXIMATE_ZOOPS) {
-			motifs[i]->freqTarget = scorer->getZoopsApproxTarget(motifs[i]->numTarget)/seqArray->numTarget;
-			motifs[i]->freqBackground = scorer->getZoopsApproxBackground(motifs[i]->numBackground)
+			motif->freqTarget = scorer->getZoopsApproxTarget(motif->numTarget)/seqArray->numTarget;
+			motif->freqBackground = scorer->getZoopsApproxBackground(motif->numBackground)
 																			/seqArray->numBackground;
 		}
 		if (threasholdOptimizationFlag == KNOWN_OPTIMIZE_THREASHOLD) {
-			motifs[i]->optimizeThreshold(scorer,maxBackgroundPercent);
+			motif->optimizeThreshold(scorer,maxBackgroundPercent);
 		} else if (threasholdOptimizationFlag == KNOWN_JUST_SCORE_ZOOPS) {
 			if (findFlag == 0 && numBackground > 0.5 && numTargets > 0.5) {
-				double logp = scorer->scoreEnrichment(motifs[i]->numTarget, motifs[i]->numBackground);
-				motifs[i]->logp = logp;
+				double logp = scorer->scoreEnrichment(motif->numTarget, motif->numBackground);
+				motif->logp = logp;
 			} else {
-				motifs[i]->logp = 0.0;
+				motif->logp = 0.0;
 			}
 		}
 	}
