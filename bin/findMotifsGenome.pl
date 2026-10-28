@@ -1161,8 +1161,29 @@ if ($cmd->{'find'} eq '') {
 	print STDERR "\tFinished preparing sequence/group files\n\n";
 
 	##########################################################
-	print STDERR "\t----------------------------------------------------------\n";
-	print STDERR "\tKnown motif enrichment\n";
+	# With -p 4 or more, the longest de novo length runs on most of the CPUs while
+	# known enrichment and the other lengths run one after another on the rest.
+	# Every child gets -Tcpus <-p>, so its trial count, and its output, stay as at -p.
+	my $concurrent = 0;
+	my $laneCPUs = $cmd->{'cpus'};
+	my $mainCPUs = $cmd->{'cpus'};
+	if ($cmd->{'homer2'} && $cmd->{'nomotif'} == 0 && $cmd->{'fdr'} == 0 && $cmd->{'oligoFlag'} == 0
+			&& $cmd->{'cpus'} >= 4 && scalar(@{$cmd->{'len'}}) >= 2) {
+		my %lens = ();
+		foreach(@{$cmd->{'len'}}) {
+			$lens{$_} = 1;
+		}
+		if (scalar(keys %lens) == scalar(@{$cmd->{'len'}})) {
+			$concurrent = 1;
+			$laneCPUs = int(($cmd->{'cpus'}+3)/4);
+			$mainCPUs = $cmd->{'cpus'} - $laneCPUs;
+		}
+	}
+	my $knownCmd = '';
+	if ($concurrent == 0) {
+		print STDERR "\t----------------------------------------------------------\n";
+		print STDERR "\tKnown motif enrichment\n";
+	}
 	my $floatAction = "GETPVALUE";
 	$floatAction = "OPTPVALUE" if ($cmd->{'float'} == 1);
 
@@ -1173,20 +1194,23 @@ if ($cmd->{'find'} eq '') {
 		$options .= " " . $cmd->{'seqlogo'};
 		$options = " -optimize" if ($floatAction eq 'OPTPVALUE');
 		if ($cmd->{'homer2'}) {
-			$options .= " -homer2 -p $cmd->{'cpus'}";
+			$options .= " -homer2 -p $laneCPUs";
 			$options .= " $cmd->{'alg'}";
 			$options .= " -cache $cmd->{'cache'}";
             $options .= " -strand + " if ($cmd->{'norevopp'} == 1);
 		}
 		#`findKnownMotifs.pl "$seqFile" "$groupFile" "$cmd->{'output'}" $knownPvalueThresh "$cmd->{'mknown'}" $floatAction`;
-		`findKnownMotifs.pl -s "$seqFile" -g "$groupFile" -o "$cmd->{'output'}" -pvalue $knownPvalueThresh -m "$cmd->{'mknown'}" $options`;
+		$knownCmd = "findKnownMotifs.pl -s \"$seqFile\" -g \"$groupFile\" -o \"$cmd->{'output'}\" -pvalue $knownPvalueThresh -m \"$cmd->{'mknown'}\" $options";
+		`$knownCmd` if ($concurrent == 0);
 	}
 
 	if ($cmd->{'nomotif'} == 1) {
 		print STDERR "\tSkipping...\n";
 	} else {
-		print STDERR "\t----------------------------------------------------------\n";
-		print STDERR "\tDe novo motif finding (HOMER)\n";
+		if ($concurrent == 0) {
+			print STDERR "\t----------------------------------------------------------\n";
+			print STDERR "\tDe novo motif finding (HOMER)\n";
+		}
 		my $options = " -S $cmd->{'S'} ";
 		my $coptions = $cmd->{'alg'} . " ";
 		$options .= $cmd->{'alg'};
@@ -1236,8 +1260,38 @@ if ($cmd->{'find'} eq '') {
 			}
 		}
 
+		my $mainLen = '';
+		my $mainPid = 0;
+		my $mainErr = '';
+		if ($concurrent) {
+			foreach(@{$cmd->{'len'}}) {
+				$mainLen = $_ if ($mainLen eq '' || $_ >= $mainLen);
+			}
+			$mainErr = $cmd->{'output'} . "/" . $tmpID . ".denovo.err.tmp";
+			my $mainTmp = $cmd->{'output'} . "/" . $tmpID . ".denovo.tmp";
+			$toDelete{$mainErr} = 1;
+			$toDelete{$mainTmp} = 1;
+			my $output = " -o \"$cmd->{'output'}/homerMotifs.motifs$mainLen\" ";
+			my $mainCmd = "homer2 denovo -s \"$seqFile\" -g \"$groupFile\" $options -p $mainCPUs -Tcpus $cmd->{'cpus'} $output -len $mainLen -tmp \"$mainTmp\"";
+			$mainPid = fork();
+			if (defined($mainPid) && $mainPid == 0) {
+				exec("$mainCmd > /dev/null 2> \"$mainErr\"") or POSIX::_exit(1);
+			}
+			print STDERR "\t----------------------------------------------------------\n";
+			print STDERR "\tKnown motif enrichment\n";
+			`$knownCmd` if ($knownCmd ne '');
+			print STDERR "\t----------------------------------------------------------\n";
+			print STDERR "\tDe novo motif finding (HOMER)\n";
+			if (defined($mainPid)) {
+				$cpuOptions = " -p $laneCPUs -Tcpus $cmd->{'cpus'} ";
+			} else {
+				$mainPid = 0;
+			}
+		}
+
 		foreach(@{$cmd->{'len'}}) {
 			my $len = $_;
+			next if ($mainPid != 0 && $len eq $mainLen);
 			if ($cmd->{'homer2'}) {
 
 				if ($cmd->{'oligoFlag'} == 1) {
@@ -1304,6 +1358,14 @@ if ($cmd->{'find'} eq '') {
 					`homer -s "$seqFile" -g "$groupFile" $options -len $_ -a MOTIFS `;
 				}
 			}
+		}
+		if ($mainPid != 0) {
+			waitpid($mainPid, 0);
+			if (open(my $errFh, '<', $mainErr)) {
+				print STDERR while (<$errFh>);
+				close $errFh;
+			}
+			unlink($mainErr);
 		}
 		$toDelete{".tmp.motifs"}=1;
 
