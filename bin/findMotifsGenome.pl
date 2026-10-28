@@ -987,17 +987,48 @@ if ($cmd->{'find'} eq '') {
 		
 	
 				my $validBgCGBins = $cmd->{'output'} . "/validBgCGBins." . $cmd->{'size'} . ".cgbins";
+				# homerTools bgbins/randbg/filterids replace mergePeaks -cobound, filterListBy.pl,
+				# cat, makeBinaryFile.pl and randRemoveBackground.pl; the old commands run for paths
+				# Perl's 2-argument open would read differently and when homerTools exits non-zero
+				my $fastBins = ($cmd->{'checkOverlaps'} == 1
+					&& perlOpenPlain($bgCGBins, $bgSeq, $targetCGBins, $groupFile, $tmpFile, $tmpFile2));
+				my $opt = "";
+				if ($cmd->{'norevopp'} == 1) {
+					$opt = ' -strand ';
+				}
 				if ($cmd->{'checkOverlaps'} == 1) {
-					my $opt = "";
-					if ($cmd->{'norevopp'} == 1) {
-						$opt = ' -strand ';
+					if (!$fastBins) {
+						`mergePeaks -cobound 1 -prefix $tmpID $opt "$bgCGPos" "$posFileSize"`;
+						`filterListBy.pl "$bgCGBins" "$tmpID.coBoundBy0.txt" 0 1 > "$validBgCGBins"`;
+						`rm "$tmpID.coBoundBy0.txt" "$tmpID.coBoundBy1.txt"`;
 					}
-					`mergePeaks -cobound 1 -prefix $tmpID $opt "$bgCGPos" "$posFileSize"`;
-					`filterListBy.pl "$bgCGBins" "$tmpID.coBoundBy0.txt" 0 1 > "$validBgCGBins"`;
-					`rm "$tmpID.coBoundBy0.txt" "$tmpID.coBoundBy1.txt"`;
 				} else {
 					`cp "$bgCGBins" "$validBgCGBins"`;
 				}
+				my $combineBins = sub {
+					if ($fastBins) {
+						`homerTools bgbins -target "$targetCGBins" -bg "$bgCGBins" -pos "$bgCGPos" -peaks "$posFileSize" -prefix $tmpID $opt -cat "$tmpFile" > "$tmpFile2"`;
+						if ($? != 0) {
+							`mergePeaks -cobound 1 -prefix $tmpID $opt "$bgCGPos" "$posFileSize"`;
+							`homerTools bgbins -target "$targetCGBins" -bg "$bgCGBins" -ids "$tmpID.coBoundBy0.txt" -cat "$tmpFile" > "$tmpFile2"`;
+						}
+					} else {
+						`cat "$targetCGBins" "$validBgCGBins" > "$tmpFile"`;
+						`makeBinaryFile.pl "$tmpFile" "$targetCGBins" > "$tmpFile2"`;
+					}
+				};
+				my $randRemove = sub {
+					my ($binArg) = @_;
+					if ($fastBins) {
+						# the first two rand() values of a fresh perl hold its whole drand48 state
+						my $state = `perl -e 'printf("%.0f %.0f", rand()*2**48, rand()*2**48)'`;
+						if ($state =~ /^\d+ \d+$/) {
+							`homerTools randbg "$tmpFile2" "$cmd->{'numSeq'}" $binArg -perlrand $state > "$tmpFile3"`;
+							return if ($? == 0);
+						}
+					}
+					`randRemoveBackground.pl "$tmpFile2" "$cmd->{'numSeq'}" $binArg > "$tmpFile3"`;
+				};
 		
 				my $wcOutput = `wc -l "$targetCGBins"`;
 				$wcOutput =~ /^\s*(\d+)\s/;
@@ -1014,21 +1045,18 @@ if ($cmd->{'find'} eq '') {
 					#`assignGeneWeights.pl "$tmpFile3" "$tmpFile" > "$groupFile"`;
 				} elsif ($cmd->{'repeats'} == 1) { 
 					print STDERR "\n\tChoosing background that matches in repeat element content...\n";
-					`cat "$targetCGBins" "$validBgCGBins" > "$tmpFile"`;
 					#`wc -l "$tmpFile" "$targetCGBins"`;
-					`makeBinaryFile.pl "$tmpFile" "$targetCGBins" > "$tmpFile2"`;
+					&$combineBins();
 					#`wc -l "$tmpFile2" "$tmpFile"`;
-					`randRemoveBackground.pl "$tmpFile2" "$cmd->{'numSeq'}" "$tmpFile" > "$tmpFile3"`;
+					&$randRemove("\"$tmpFile\"");
 					#`wc -l "$tmpFile3" "$tmpFile"`;
 					`assignGeneWeights.pl "$tmpFile3" "$tmpFile" > "$groupFile"`;
 				} elsif ($cmd->{'cgweight'} == 1) { 
 					print STDERR "\n\tChoosing background that matches in CpG/GC content...\n";
-					`wc -l "$targetCGBins" "$validBgCGBins"`;
-					`cat "$targetCGBins" "$validBgCGBins" > "$tmpFile"`;
 					#`wc -l "$tmpFile" "$targetCGBins"`;
-					`makeBinaryFile.pl "$tmpFile" "$targetCGBins" > "$tmpFile2"`;
+					&$combineBins();
 					#`wc -l "$tmpFile2" "$tmpFile"`;
-					`randRemoveBackground.pl "$tmpFile2" "$cmd->{'numSeq'}" "$tmpFile" > "$tmpFile3"`;
+					&$randRemove("\"$tmpFile\"");
 					#`wc -l "$tmpFile3" "$tmpFile"`;
 					`assignGeneWeights.pl "$tmpFile3" "$tmpFile" > "$groupFile"`;
 				} elsif ($cmd->{'tssweight'} == 1) { 
@@ -1038,20 +1066,27 @@ if ($cmd->{'find'} eq '') {
 					#`assignGeneWeights.pl "$tmpFile3" "$tmpFile" > "$groupFile"`;
 				} else {
 					print STDERR "\tRandomly choosing background...\n";
-					`cat "$targetCGBins" "$validBgCGBins" > "$tmpFile"`;
-					`makeBinaryFile.pl "$tmpFile" "$targetCGBins" > "$tmpFile2"`;
-					`randRemoveBackground.pl "$tmpFile2" "$cmd->{'numSeq'}" null > "$tmpFile3"`;
+					&$combineBins();
+					&$randRemove("null");
 					`cp "$tmpFile3" "$groupFile"`;
 				}
 			
 				print STDERR "\tAssembling sequence file...\n";
-				`filterListBy.pl  "$bgSeq" "$groupFile" 0 1 > "$tmpFile"`;
+				if ($fastBins) {
+					`homerTools filterids "$bgSeq" "$groupFile" > "$tmpFile"`;
+				} else {
+					`filterListBy.pl  "$bgSeq" "$groupFile" 0 1 > "$tmpFile"`;
+				}
 				if ($cmd->{'dumpFasta'}==1) {
 					`tab2fasta.pl "$tmpFile" > "$dumpFastaBackground"`;
 					`tab2fasta.pl "$targetNonRedun" > "$dumpFastaTarget"`;
 				}
 				`cat "$targetNonRedun" "$tmpFile" > "$seqFile"`;
-				`rm "$tmpFile" "$tmpFile2" "$tmpFile3" "$validBgCGBins"`;
+				if ($fastBins) {
+					`rm "$tmpFile" "$tmpFile2" "$tmpFile3" "$tmpID.coBoundBy0.txt" "$tmpID.coBoundBy1.txt"`;
+				} else {
+					`rm "$tmpFile" "$tmpFile2" "$tmpFile3" "$validBgCGBins"`;
+				}
 			}
 			$toDelete{$groupFile}=1;
 			$toDelete{$seqFile}=1;
@@ -1071,6 +1106,10 @@ if ($cmd->{'find'} eq '') {
 		$options .= " -nmax $cmd->{'nmax'} ";
 		$options .= " -nlen $cmd->{'nlen'} ";
 		$options .= " -nout \"$noutFile\" ";
+		# norm's output does not depend on -p; any other value runs it on one thread
+		if (defined($cmd->{'cpus'}) && $cmd->{'cpus'} =~ /^\d+$/ && $cmd->{'cpus'} > 0) {
+			$options .= " -p $cmd->{'cpus'} ";
+		}
 		$options .= $cmd->{'neutral'};
 		`homer2 norm -g "$groupFile" -s "$seqFile" $options  > "$tmpFile"`;
 		`mv "$tmpFile" "$groupFile"`;
@@ -1122,8 +1161,29 @@ if ($cmd->{'find'} eq '') {
 	print STDERR "\tFinished preparing sequence/group files\n\n";
 
 	##########################################################
-	print STDERR "\t----------------------------------------------------------\n";
-	print STDERR "\tKnown motif enrichment\n";
+	# With -p 4 or more, the longest de novo length runs on most of the CPUs while
+	# known enrichment and the other lengths run one after another on the rest.
+	# Every child gets -Tcpus <-p>, so its trial count, and its output, stay as at -p.
+	my $concurrent = 0;
+	my $laneCPUs = $cmd->{'cpus'};
+	my $mainCPUs = $cmd->{'cpus'};
+	if ($cmd->{'homer2'} && $cmd->{'nomotif'} == 0 && $cmd->{'fdr'} == 0 && $cmd->{'oligoFlag'} == 0
+			&& $cmd->{'cpus'} >= 4 && scalar(@{$cmd->{'len'}}) >= 2) {
+		my %lens = ();
+		foreach(@{$cmd->{'len'}}) {
+			$lens{$_} = 1;
+		}
+		if (scalar(keys %lens) == scalar(@{$cmd->{'len'}})) {
+			$concurrent = 1;
+			$laneCPUs = int(($cmd->{'cpus'}+3)/4);
+			$mainCPUs = $cmd->{'cpus'} - $laneCPUs;
+		}
+	}
+	my $knownCmd = '';
+	if ($concurrent == 0) {
+		print STDERR "\t----------------------------------------------------------\n";
+		print STDERR "\tKnown motif enrichment\n";
+	}
 	my $floatAction = "GETPVALUE";
 	$floatAction = "OPTPVALUE" if ($cmd->{'float'} == 1);
 
@@ -1134,20 +1194,23 @@ if ($cmd->{'find'} eq '') {
 		$options .= " " . $cmd->{'seqlogo'};
 		$options = " -optimize" if ($floatAction eq 'OPTPVALUE');
 		if ($cmd->{'homer2'}) {
-			$options .= " -homer2 -p $cmd->{'cpus'}";
+			$options .= " -homer2 -p $laneCPUs";
 			$options .= " $cmd->{'alg'}";
 			$options .= " -cache $cmd->{'cache'}";
             $options .= " -strand + " if ($cmd->{'norevopp'} == 1);
 		}
 		#`findKnownMotifs.pl "$seqFile" "$groupFile" "$cmd->{'output'}" $knownPvalueThresh "$cmd->{'mknown'}" $floatAction`;
-		`findKnownMotifs.pl -s "$seqFile" -g "$groupFile" -o "$cmd->{'output'}" -pvalue $knownPvalueThresh -m "$cmd->{'mknown'}" $options`;
+		$knownCmd = "findKnownMotifs.pl -s \"$seqFile\" -g \"$groupFile\" -o \"$cmd->{'output'}\" -pvalue $knownPvalueThresh -m \"$cmd->{'mknown'}\" $options";
+		`$knownCmd` if ($concurrent == 0);
 	}
 
 	if ($cmd->{'nomotif'} == 1) {
 		print STDERR "\tSkipping...\n";
 	} else {
-		print STDERR "\t----------------------------------------------------------\n";
-		print STDERR "\tDe novo motif finding (HOMER)\n";
+		if ($concurrent == 0) {
+			print STDERR "\t----------------------------------------------------------\n";
+			print STDERR "\tDe novo motif finding (HOMER)\n";
+		}
 		my $options = " -S $cmd->{'S'} ";
 		my $coptions = $cmd->{'alg'} . " ";
 		$options .= $cmd->{'alg'};
@@ -1197,8 +1260,38 @@ if ($cmd->{'find'} eq '') {
 			}
 		}
 
+		my $mainLen = '';
+		my $mainPid = 0;
+		my $mainErr = '';
+		if ($concurrent) {
+			foreach(@{$cmd->{'len'}}) {
+				$mainLen = $_ if ($mainLen eq '' || $_ >= $mainLen);
+			}
+			$mainErr = $cmd->{'output'} . "/" . $tmpID . ".denovo.err.tmp";
+			my $mainTmp = $cmd->{'output'} . "/" . $tmpID . ".denovo.tmp";
+			$toDelete{$mainErr} = 1;
+			$toDelete{$mainTmp} = 1;
+			my $output = " -o \"$cmd->{'output'}/homerMotifs.motifs$mainLen\" ";
+			my $mainCmd = "homer2 denovo -s \"$seqFile\" -g \"$groupFile\" $options -p $mainCPUs -Tcpus $cmd->{'cpus'} $output -len $mainLen -tmp \"$mainTmp\"";
+			$mainPid = fork();
+			if (defined($mainPid) && $mainPid == 0) {
+				exec("$mainCmd > /dev/null 2> \"$mainErr\"") or POSIX::_exit(1);
+			}
+			print STDERR "\t----------------------------------------------------------\n";
+			print STDERR "\tKnown motif enrichment\n";
+			`$knownCmd` if ($knownCmd ne '');
+			print STDERR "\t----------------------------------------------------------\n";
+			print STDERR "\tDe novo motif finding (HOMER)\n";
+			if (defined($mainPid)) {
+				$cpuOptions = " -p $laneCPUs -Tcpus $cmd->{'cpus'} ";
+			} else {
+				$mainPid = 0;
+			}
+		}
+
 		foreach(@{$cmd->{'len'}}) {
 			my $len = $_;
+			next if ($mainPid != 0 && $len eq $mainLen);
 			if ($cmd->{'homer2'}) {
 
 				if ($cmd->{'oligoFlag'} == 1) {
@@ -1266,6 +1359,14 @@ if ($cmd->{'find'} eq '') {
 				}
 			}
 		}
+		if ($mainPid != 0) {
+			waitpid($mainPid, 0);
+			if (open(my $errFh, '<', $mainErr)) {
+				print STDERR while (<$errFh>);
+				close $errFh;
+			}
+			unlink($mainErr);
+		}
 		$toDelete{".tmp.motifs"}=1;
 
 		if ($cmd->{'checkFlag'} == 1 && $cmd->{'nomotif'} == 0) {
@@ -1327,6 +1428,15 @@ if ($cmd->{'keepFiles'} == 0) {
 }
 print STDERR "\n";
 exit;
+
+# True when Perl's 2-argument open reads every path as written: no leading or
+# trailing whitespace, no mode characters, not "-".
+sub perlOpenPlain {
+	foreach(@_) {
+		return 0 if ($_ eq '-' || /^\s/ || /\s$/ || /^[<>+|]/ || /\|$/);
+	}
+	return 1;
+}
 
 sub deleteFiles {
 	my ($files) = @_;

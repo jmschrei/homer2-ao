@@ -11,7 +11,7 @@ LIBRARIES = -lpthread -lstdc++ -lm
 #COMPILER = CC
 #LIBRARIES = -lCstd -lm
 
-homer2 homer getMappableRegions makeTagDirectory getPeakTags makeUCSCfile getDifferentialPeaks mergePeaks genomeOntology homerTools analyzeHiC getGenomeTilingPeaks : Hashtable.o Motif.o statistics.o CommandLine.o homer.o getMappableRegions.o SeqTag.o makeTagDirectory.o getPeakTags.o findPeaks.o makeUCSCfile.o getDifferentialPeaks.o assignGenomeAnnotation.o mergePeaks.o genomeOntology.o homerTools.o analyzeHiC.o Motif2.o homer2.o Clustering.o getGenomeCorrelation.o findTADsAndLoopsFromRelMatrix.o
+homer2 homer getMappableRegions makeTagDirectory getPeakTags makeUCSCfile getDifferentialPeaks mergePeaks genomeOntology homerTools analyzeHiC getGenomeTilingPeaks : Hashtable.o Motif.o statistics.o CommandLine.o homer.o getMappableRegions.o SeqTag.o makeTagDirectory.o getPeakTags.o findPeaks.o makeUCSCfile.o getDifferentialPeaks.o assignGenomeAnnotation.o mergePeaks.o genomeOntology.o homerTools.o analyzeHiC.o Motif2.o homer2.o Clustering.o getGenomeCorrelation.o findTADsAndLoopsFromRelMatrix.o compareMotifMatrices.o
 	$(COMPILER) homer.o CommandLine.o Motif.o statistics.o Hashtable.o $(LIBRARIES) $(DEBUG) -o homer
 	$(COMPILER) getMappableRegions.o Hashtable.o $(LIBRARIES) $(DEBUG) -o getMappableRegions
 	$(COMPILER) getPeakTags.o SeqTag.o Motif2.o Clustering.o Hashtable.o statistics.o $(LIBRARIES) $(DEBUG) -o getPeakTags
@@ -27,6 +27,7 @@ homer2 homer getMappableRegions makeTagDirectory getPeakTags makeUCSCfile getDif
 	$(COMPILER) findTADsAndLoopsFromRelMatrix.o SeqTag.o Motif2.o Clustering.o Hashtable.o statistics.o $(LIBRARIES) $(DEBUG) -o findTADsAndLoopsFromRelMatrix
 	$(COMPILER) getGenomeCorrelation.o SeqTag.o Motif2.o Clustering.o Hashtable.o statistics.o $(LIBRARIES) $(DEBUG) -o getGenomeTilingPeaks
 	$(COMPILER) homer2.o Motif2.o Hashtable.o statistics.o $(LIBRARIES) $(DEBUG) -o homer2
+	$(COMPILER) compareMotifMatrices.o $(LIBRARIES) $(DEBUG) -o compareMotifMatrices
 	cp findPeaks ../bin/
 	cp mergePeaks ../bin/
 	cp genomeOntology ../bin/
@@ -40,6 +41,7 @@ homer2 homer getMappableRegions makeTagDirectory getPeakTags makeUCSCfile getDif
 	cp homer ../bin/
 	cp makeTagDirectory ../bin/
 	cp homer2 ../bin/
+	cp compareMotifMatrices ../bin/
 	cp getMappableRegions ../bin/
 	cp getGenomeTilingPeaks ../bin/getGenomeTilingPeaks
 
@@ -67,6 +69,9 @@ homer.o : homer.cpp
 	$(COMPILER) homer.cpp -c $(DEBUG)
 homer2.o : homer2.cpp
 	$(COMPILER) homer2.cpp -c $(DEBUG)
+# no fused multiply-add: its scores must match compareMotifs.pl's Perl arithmetic bit for bit
+compareMotifMatrices.o : compareMotifMatrices.cpp
+	$(COMPILER) compareMotifMatrices.cpp -c $(DEBUG) -ffp-contract=off
 getPeakTags.o : getPeakTags.cpp SeqTag.h SeqTag.cpp
 	$(COMPILER) getPeakTags.cpp -c $(DEBUG)
 makeUCSCfile.o : makeUCSCfile.cpp SeqTag.h SeqTag.cpp
@@ -90,4 +95,4 @@ SeqTag.o : SeqTag.cpp SeqTag.h
 
 clean:
 	rm -f *.o;
-	rm -f getMappableRegions makeTagDirectory findPeaks mergePeaks genomeOntology getPeakTags makeUCSCfile getDifferentialPeaks assignGenomeAnnotation homerTools homer homer2 analyzeHiC getGenomeTilingPeaks findTADsAndLoopsFromRelMatrix;
+	rm -f getMappableRegions makeTagDirectory findPeaks mergePeaks genomeOntology getPeakTags makeUCSCfile getDifferentialPeaks assignGenomeAnnotation homerTools homer homer2 analyzeHiC getGenomeTilingPeaks findTADsAndLoopsFromRelMatrix compareMotifMatrices;

@@ -861,6 +861,7 @@ if ($cmd->{'find'} eq '' && $cmd->{'reuse'} == 0) {
 			my $options = "";
 			$options .= " -strand + " if ($cmd->{'norevopp'} == 1);
 			$options .= " -nmax $cmd->{'nmax'}";
+			$options .= " -p $cmd->{'cpus'} ";
 			$options .= $cmd->{'neutral'};
 			#print STDERR "`homer2 norm -g $adjFile -s $seqFile -nlen $cmd->{'nlen'} $options -nout $noutFile > $tmpCGFreq`;\n";
 			`homer2 norm -g "$adjFile" -s "$seqFile" -nlen $cmd->{'nlen'} $options -nout "$noutFile" > "$tmpCGFreq"`;
