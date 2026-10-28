@@ -410,6 +410,7 @@ public:
 	double minimumSeedLogp;
 	int totalMotifsToFind;
 	int numTrialMotifs;
+	int trialCPUs;
 	int numConcurrentMotifs;
 	int maxOptimizationIterations;
 	int motifOptimizationMethod;

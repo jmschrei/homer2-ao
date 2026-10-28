@@ -96,6 +96,7 @@ void printCMDdenovo() {
 																	MOTIF_MAX_HIT_RATE_TO_CONSIDER);
 	fprintf(stderr, "\t\t-T <#> (number of trial matrices when optimizing, default: %d)\n",
 																	MOTIFS_NUM_POTENTIAL_MOTIFS);
+	fprintf(stderr, "\t\t-Tcpus <#> (round -T to a multiple of this many CPUs instead of -p, default: -p)\n");
 	fprintf(stderr, "\t\t-blen <#> (# of bp on either side to check for redundancy, default: 1)\n");
 	fprintf(stderr, "\t\t-maxBack <#> (Max percentage of background that motifs may contain, default: 0.5)\n");
 	fprintf(stderr, "\t\t-minlp <#> (minimum significance of seeds to optimize, default: %.3lf)\n",
@@ -144,6 +145,8 @@ void programDeNovo(int argc, char** argv) {
 			sscanf(argv[++i],"%d", &(denovo->maxAutoNormIters));
 		} else if (strcmp(argv[i],"-T")==0) {
 			sscanf(argv[++i],"%d", &(denovo->numTrialMotifs));
+		} else if (strcmp(argv[i],"-Tcpus")==0) {
+			sscanf(argv[++i],"%d", &(denovo->trialCPUs));
 		} else if (strcmp(argv[i],"-minlp")==0) {
 			sscanf(argv[++i],"%lf", &(denovo->minimumSeedLogp));
 		} else if (strcmp(argv[i],"-p")==0) {
@@ -615,6 +618,7 @@ void DeNovoMotifs::init() {
 
 	totalMotifsToFind = MOTIF_DEFAULT_NUMBER_OF_MOTIFS;
 	numTrialMotifs = MOTIFS_NUM_POTENTIAL_MOTIFS;
+	trialCPUs = 0;
 	maxOptimizationIterations = MOTIFS_MAX_OPT_ITERATIONS;
 	motifOptimizationMethod = MOTIF_OPTIMZATION_DIFFERENT_THRESHOLDS;
 	
@@ -625,14 +629,17 @@ void DeNovoMotifs::init() {
 
 void DeNovoMotifs::checkParameters() {
 	if (numCPUs < 1) numCPUs = 1;
-	if (numCPUs > 1) {
+	// -Tcpus: the trial threads take matrices from a shared queue, so any -p gives
+	// the same motifs for a given -T; this keeps the -T that -p <trialCPUs> would use.
+	int tcpus = (trialCPUs > 0) ? trialCPUs : (int)numCPUs;
+	if (tcpus > 1) {
 		int og = numTrialMotifs;
-		int trialsPerCPU = ((int)(((((double)numTrialMotifs)/((double)numCPUs)))+0.5));
+		int trialsPerCPU = ((int)(((((double)numTrialMotifs)/((double)tcpus)))+0.5));
 		if (trialsPerCPU < 1) trialsPerCPU = 1;
-		numTrialMotifs = trialsPerCPU*numCPUs;
+		numTrialMotifs = trialsPerCPU*tcpus;
 		if (og != numTrialMotifs) {
 			fprintf(stderr, "\tNumber of Trial motifs (-T) set to %d (from %d) to work well with %d CPUs\n",
-							numTrialMotifs, og, numCPUs);
+							numTrialMotifs, og, tcpus);
 		}
 	}
 	if (inputFASTAfile == NULL || bgFASTAfile == NULL) {
