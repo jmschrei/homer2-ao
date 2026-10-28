@@ -451,7 +451,7 @@ public:
 	void printGroupFile(FILE* fp);
 	void printSequenceFile(FILE* fp);
 	void motifScan(Motif* m,int strand, int offset,int mode,FILE* fp, pthread_mutex_t fileLock);
-	void normalizeSequence(int nlen, int strand, char* normFile, int equalFlag);
+	void normalizeSequence(int nlen, int strand, char* normFile, int equalFlag, int threads = 1);
 	double normalizeSequenceIteration(int nlen, int strand, char* normFile, int printFlag,int neutralFlag);
 	void maskMotifFromOligoArray(Motif* motif,OligoArray* oligoArray,char strand);
 	void initializeScorer(int scoringMethod,int zoopsFlag,unsigned long long int maxCacheSize);

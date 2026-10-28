@@ -1106,6 +1106,10 @@ if ($cmd->{'find'} eq '') {
 		$options .= " -nmax $cmd->{'nmax'} ";
 		$options .= " -nlen $cmd->{'nlen'} ";
 		$options .= " -nout \"$noutFile\" ";
+		# norm's output does not depend on -p; any other value runs it on one thread
+		if (defined($cmd->{'cpus'}) && $cmd->{'cpus'} =~ /^\d+$/ && $cmd->{'cpus'} > 0) {
+			$options .= " -p $cmd->{'cpus'} ";
+		}
 		$options .= $cmd->{'neutral'};
 		`homer2 norm -g "$groupFile" -s "$seqFile" $options  > "$tmpFile"`;
 		`mv "$tmpFile" "$groupFile"`;

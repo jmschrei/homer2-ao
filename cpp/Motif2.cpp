@@ -7290,40 +7290,312 @@ void Motif::calculateDistributionStats() {
 }
 
 
-void SequenceArray::normalizeSequence(int nlen,int strand,char* normFile,int neutralFlag) {
-	if (nlen < 1) return;
-
-	double lastError = 1e100;
-	double next = 1.0;
-	double cur = 0.0;
-	
-	for (int i=0;i<maxAutoNormIters;i++) {
-		int printFlag = 0;
-		if (i==0) {
-			printFlag = 1;
-		}
-		double curError = normalizeSequenceIteration(nlen,strand,normFile,printFlag,neutralFlag);
-		//double improvementRate = (lastError-curError)/lastError;
-		//fprintf(stderr, "Round %d:\tLastError: %le\tCurrentError:%le\tImprovment:%le\n", i+1,lastError,curError,improvementRate);
-		if (curError >= lastError) break;
-		//if (improvementRate < MIN_OLIGO_NORMALIZATION_IMPROVEMENT) break;
-		lastError = curError;
-		if (printFlag) {
-			fprintf(stderr, "\tConverging on autonormalization solution:\n\t");
-		} else {
-			cur += 80.0/(double)maxAutoNormIters;
-			if (cur > next) {
-				fprintf(stderr, ".");
-				next += 1.0;
+// homer2 norm (and homer2 known -nlen): every iteration of normalizeSequence
+// counts the same oligos and only the weights change, so each length's oligo
+// codes are found once. A code is HOMER v5.1's: sum of base(j+k)*4^k (A,C,G,T
+// = 0..3) over the window at j < length-curLen, skipped when it holds an N.
+struct NormPart {
+	int b0, nb;			// bins b0..b0+nb-1
+	int* count;			// nb == 1: the bin's count per sequence
+	long long* start;	// nb > 1: per sequence, offsets into list
+	void* list;			// nb > 1: the sequence's codes in the range, in position order
+};
+struct NormLen {
+	int built;
+	int wide;			// codes are int (more than 256 bins), else unsigned char
+	long long* start;	// per sequence (numSeqs+1), offsets into codes
+	void* codes;		// codes of the windows without N, in position order
+	int* good;			// their number per sequence (HOMER v5.1's totalGood)
+	int numParts;
+	NormPart* parts;
+};
+class NormState {
+public:
+	SequenceArray* sa;
+	int numSeqs, nlen, threads;
+	double* w;
+	int* g;
+	NormLen* lens;
+	NormState(SequenceArray* sa, int nlen, int threads);
+	~NormState();
+	void build(int curLen, int total);
+	double iterate(int strand, char* normFile, int printFlag, int neutralFlag);
+	void writeWeights();
+};
+NormState::NormState(SequenceArray* a, int n, int t) {
+	sa = a;
+	numSeqs = sa->numSeqs;
+	nlen = n;
+	threads = (t < 1) ? 1 : t;
+	w = new double[numSeqs+1];
+	g = new int[numSeqs+1];
+	for (int i=0;i<numSeqs;i++) {
+		w[i] = sa->seqs[i]->w;
+		g[i] = sa->seqs[i]->g;
+	}
+	lens = new NormLen[nlen+1];
+	for (int i=0;i<=nlen;i++) lens[i].built = 0;
+}
+NormState::~NormState() {
+	for (int L=0;L<=nlen;L++) {
+		NormLen& nl = lens[L];
+		if (!nl.built) continue;
+		for (int p=0;p<nl.numParts;p++) {
+			NormPart& q = nl.parts[p];
+			if (q.nb == 1) {
+				delete []q.count;
+			} else if (q.list != nl.codes) {
+				delete []q.start;
+				if (nl.wide) delete [](int*)q.list;
+				else delete [](unsigned char*)q.list;
 			}
 		}
+		delete []nl.parts;
+		if (nl.wide) delete [](int*)nl.codes;
+		else delete [](unsigned char*)nl.codes;
+		delete []nl.start;
+		delete []nl.good;
 	}
-	fprintf(stderr, "\n");
-	fprintf(stderr, "\tFinal normalization:");
-	(void)normalizeSequenceIteration(nlen,strand,NULL,1,neutralFlag);
+	delete []lens;
+	delete []w;
+	delete []g;
+}
+void NormState::writeWeights() {
+	for (int i=0;i<numSeqs;i++) sa->seqs[i]->w = w[i];
 }
 
-double SequenceArray::normalizeSequenceIteration(int nlen,int strand,char* normFile,int printFlag,int neutralFlag) {
+template <class C>
+static void normFillParts(NormLen& nl, int numSeqs) {
+	const C* codes = (const C*)nl.codes;
+	for (int p=0;p<nl.numParts;p++) {
+		NormPart& q = nl.parts[p];
+		if (q.nb == 1) {
+			q.count = new int[numSeqs+1];
+			for (int i=0;i<numSeqs;i++) {
+				int c = 0;
+				for (long long j=nl.start[i];j<nl.start[i+1];j++) if ((int)codes[j] == q.b0) c++;
+				q.count[i] = c;
+			}
+		} else if (nl.numParts == 1) {
+			q.start = nl.start;
+			q.list = nl.codes;
+		} else {
+			long long n = 0;
+			for (long long j=0;j<nl.start[numSeqs];j++) {
+				int c = (int)codes[j];
+				if (c >= q.b0 && c < q.b0+q.nb) n++;
+			}
+			C* list = new C[n+1];
+			q.start = new long long[numSeqs+1];
+			n = 0;
+			for (int i=0;i<numSeqs;i++) {
+				q.start[i] = n;
+				for (long long j=nl.start[i];j<nl.start[i+1];j++) {
+					int c = (int)codes[j];
+					if (c >= q.b0 && c < q.b0+q.nb) list[n++] = codes[j];
+				}
+			}
+			q.start[numSeqs] = n;
+			q.list = list;
+		}
+	}
+}
+
+void NormState::build(int curLen, int total) {
+	NormLen& nl = lens[curLen];
+	nl.built = 1;
+	nl.wide = (total > 256);
+	nl.start = new long long[numSeqs+1];
+	nl.good = new int[numSeqs+1];
+	long long n = 0;
+	for (int i=0;i<numSeqs;i++) {
+		int nbins = sa->seqs[i]->length-curLen;
+		if (nbins > 0) n += nbins;
+	}
+	unsigned char* codes8 = NULL;
+	int* codes32 = NULL;
+	if (nl.wide) {
+		codes32 = new int[n+1];
+		nl.codes = codes32;
+	} else {
+		codes8 = new unsigned char[n+1];
+		nl.codes = codes8;
+	}
+	char alphaIndex[256];
+	alphaIndex[65]=0; //alphaIndex['A']=0;
+	alphaIndex[67]=1; //alphaIndex['C']=1;
+	alphaIndex[71]=2; //alphaIndex['G']=2;
+	alphaIndex[84]=3; //alphaIndex['T']=3;
+	int* pow4 = new int[curLen+1];
+	pow4[0]=1;
+	for (int i=1;i<=curLen;i++) pow4[i] = 4*pow4[i-1];
+	n = 0;
+	for (int i=0;i<numSeqs;i++) {
+		nl.start[i] = n;
+		char* s = sa->seqs[i]->s;
+		int nbins = sa->seqs[i]->length-curLen;
+		for (int j=0;j<nbins;j++) {
+			int index = 0;
+			int bad = 0;
+			for (int k=0;k<curLen;k++) {
+				if (s[j+k] == 'N') {
+					bad = 1;
+					break;
+				}
+				index += alphaIndex[(int)s[j+k]]*pow4[k];
+			}
+			if (bad) continue;
+			if (nl.wide) codes32[n] = index;
+			else codes8[n] = (unsigned char)index;
+			n++;
+		}
+		nl.good[i] = (int)(n-nl.start[i]);
+	}
+	nl.start[numSeqs] = n;
+	delete []pow4;
+
+	// first pass work: one bin per part up to 16 bins (its sums stay in a
+	// register), else one range of bins per thread
+	int P = total;
+	if (total > 16) P = (threads < total) ? threads : total;
+	nl.numParts = P;
+	nl.parts = new NormPart[P];
+	for (int p=0;p<P;p++) {
+		NormPart& q = nl.parts[p];
+		q.b0 = (int)(((long long)total*p)/P);
+		q.nb = (int)(((long long)total*(p+1))/P) - q.b0;
+		q.count = NULL;
+		q.start = NULL;
+		q.list = NULL;
+	}
+	if (nl.wide) normFillParts<int>(nl, numSeqs);
+	else normFillParts<unsigned char>(nl, numSeqs);
+}
+
+// first pass, one part: each bin adds w/good once per occurrence, sequence
+// after sequence, as HOMER v5.1 does (within a sequence the addends are equal)
+template <class C>
+static void normCountPart(NormState* st, NormLen& nl, NormPart& q, double* targetLevels,
+						double* backgroundLevels) {
+	const double* w = st->w;
+	const int* g = st->g;
+	int numSeqs = st->numSeqs;
+	if (q.nb == 1) {
+		double xt = 0.0;
+		double xb = 0.0;
+		for (int i=0;i<numSeqs;i++) {
+			int c = q.count[i];
+			if (c == 0) continue;
+			double v = w[i]/(double)nl.good[i];
+			if (g[i] == 1) {
+				for (int j=0;j<c;j++) xt += v;
+			} else {
+				for (int j=0;j<c;j++) xb += v;
+			}
+		}
+		targetLevels[q.b0] = xt;
+		backgroundLevels[q.b0] = xb;
+		return;
+	}
+	// own copies, padded, so that threads write no shared line; sized in
+	// size_t, since one part can hold all 4^15 bins
+	double* lt = new double[2*(size_t)q.nb+24];
+	double* lb = lt+(size_t)q.nb+16;
+	lt += 8;
+	for (int b=0;b<q.nb;b++) {
+		lt[b] = 0.0;
+		lb[b] = 0.0;
+	}
+	const C* list = (const C*)q.list;
+	for (int i=0;i<numSeqs;i++) {
+		long long s = q.start[i];
+		long long e = q.start[i+1];
+		if (s == e) continue;
+		double v = w[i]/(double)nl.good[i];
+		double* x = (g[i] == 1) ? lt : lb;
+		for (long long j=s;j<e;j++) x[(int)list[j]-q.b0] += v;
+	}
+	for (int b=0;b<q.nb;b++) {
+		targetLevels[q.b0+b] = lt[b];
+		backgroundLevels[q.b0+b] = lb[b];
+	}
+	delete [](lt-8);
+}
+
+static inline void normNewWeight(double* w, int i, double newScore, int good) {
+	double scoreUnit = w[i];
+	double gOligos = (double)good;
+	if (gOligos > 0.5) {
+		newScore /= gOligos;
+	}
+	double newWeight = newScore*scoreUnit;
+	if (newWeight < HOMER_MINIMUM_SEQ_WEIGHT) newWeight = HOMER_MINIMUM_SEQ_WEIGHT;
+	if (newWeight > 1.0/HOMER_MINIMUM_SEQ_WEIGHT) newWeight = 1.0/HOMER_MINIMUM_SEQ_WEIGHT;
+
+	double penalty = newWeight;
+	if (newWeight < 1) penalty = 1/newWeight;
+	penalty*=penalty;
+
+	double delta = newWeight-w[i];
+	double newWeight1 = w[i]+delta;
+	if (penalty > 1 && ((delta > 0 && newWeight > 1) || (delta < 0 && newWeight < 1))) {
+		newWeight1 = w[i]+delta/penalty;
+	}
+	w[i] = newWeight1;
+}
+
+// second pass over upd[lo..hi): each sequence's score sums its factors in
+// position order; four sequences at a time, so that their sums overlap
+template <class C>
+static void normReweight(NormState* st, NormLen& nl, const int* upd, int lo, int hi,
+						const double* normFactors, const double* normFactorsT) {
+	const C* codes = (const C*)nl.codes;
+	const int* g = st->g;
+	double* w = st->w;
+	int r = lo;
+	for (;r+4<=hi;r+=4) {
+		int i0 = upd[r], i1 = upd[r+1], i2 = upd[r+2], i3 = upd[r+3];
+		const C* c0 = codes+nl.start[i0];
+		const C* c1 = codes+nl.start[i1];
+		const C* c2 = codes+nl.start[i2];
+		const C* c3 = codes+nl.start[i3];
+		int n0 = nl.good[i0], n1 = nl.good[i1], n2 = nl.good[i2], n3 = nl.good[i3];
+		const double* f0 = (g[i0] == 1) ? normFactorsT : normFactors;
+		const double* f1 = (g[i1] == 1) ? normFactorsT : normFactors;
+		const double* f2 = (g[i2] == 1) ? normFactorsT : normFactors;
+		const double* f3 = (g[i3] == 1) ? normFactorsT : normFactors;
+		double s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+		int m = n0;
+		if (n1 < m) m = n1;
+		if (n2 < m) m = n2;
+		if (n3 < m) m = n3;
+		for (int j=0;j<m;j++) {
+			s0 += f0[c0[j]];
+			s1 += f1[c1[j]];
+			s2 += f2[c2[j]];
+			s3 += f3[c3[j]];
+		}
+		for (int j=m;j<n0;j++) s0 += f0[c0[j]];
+		for (int j=m;j<n1;j++) s1 += f1[c1[j]];
+		for (int j=m;j<n2;j++) s2 += f2[c2[j]];
+		for (int j=m;j<n3;j++) s3 += f3[c3[j]];
+		normNewWeight(w, i0, s0, n0);
+		normNewWeight(w, i1, s1, n1);
+		normNewWeight(w, i2, s2, n2);
+		normNewWeight(w, i3, s3, n3);
+	}
+	for (;r<hi;r++) {
+		int i = upd[r];
+		const C* c = codes+nl.start[i];
+		int n = nl.good[i];
+		const double* f = (g[i] == 1) ? normFactorsT : normFactors;
+		double s = 0;
+		for (int j=0;j<n;j++) s += f[c[j]];
+		normNewWeight(w, i, s, n);
+	}
+}
+
+double NormState::iterate(int strand, char* normFile, int printFlag, int neutralFlag) {
 
 	FILE* fp = NULL;
 	if (normFile != NULL && printFlag) {
@@ -7344,11 +7616,17 @@ double SequenceArray::normalizeSequenceIteration(int nlen,int strand,char* normF
 	alpha[1]='C';
 	alpha[2]='G';
 	alpha[3]='T';
-	int* totalGood = new int[numSeqs];
 	double* neutralFreq = new double[nlen+1];
 	neutralFreq[0] = 1.0;
 	for (int i=0;i<nlen+1;i++) {
 		neutralFreq[i]=pow(4.0,-1.0*i);
+	}
+	// the sequences the second pass reweights
+	int* upd = new int[numSeqs+1];
+	int numUpd = 0;
+	for (int i=0;i<numSeqs;i++) {
+		if (neutralFlag == 0 && g[i] == 1) continue;
+		upd[numUpd++] = i;
 	}
 
 	double error = 0.0;
@@ -7370,41 +7648,22 @@ double SequenceArray::normalizeSequenceIteration(int nlen,int strand,char* normF
 			normFactors[i] = 1.0;
 			normFactorsT[i] = 1.0;
 		}
+		if (!lens[curLen].built) build(curLen, total);
+		NormLen& nl = lens[curLen];
 
-		for (int i=0;i<numSeqs;i++) {
-			char* s = seqs[i]->s;
-			int goodOligos = 0;
-			int nbins = seqs[i]->length-curLen;
-			for (int j=0;j<nbins;j++) {
-				int bad = 0;
-				for (int k=0;k<curLen;k++) {
-					if (s[j+k] == 'N') {
-						bad = 1;
-						break;
-					}
+		{
+			int nt = (threads < nl.numParts) ? threads : nl.numParts;
+			std::atomic<int> next(0);
+			auto work = [&]() {
+				for (int p=next++;p<nl.numParts;p=next++) {
+					if (nl.wide) normCountPart<int>(this, nl, nl.parts[p], targetLevels, backgroundLevels);
+					else normCountPart<unsigned char>(this, nl, nl.parts[p], targetLevels, backgroundLevels);
 				}
-				if (bad) continue;
-				goodOligos++;
-			}
-			totalGood[i] = goodOligos;
-			double gOligos = (double)totalGood[i];
-			for (int j=0;j<nbins;j++) {
-				int index = 0;
-				int bad = 0;
-				for (int k=0;k<curLen;k++) {
-					if (s[j+k] == 'N') {
-						bad = 1;
-						break;
-					}
-					index += alphaIndex[(int)s[j+k]]*pow4[k];
-				}
-				if (bad) continue;
-				if (seqs[i]->g == 1) {
-					targetLevels[index] += seqs[i]->w/gOligos;
-				} else {
-					backgroundLevels[index] += seqs[i]->w/gOligos;
-				}
-			}
+			};
+			std::vector<std::thread> pool;
+			for (int t=1;t<nt;t++) pool.emplace_back(work);
+			work();
+			for (size_t t=0;t<pool.size();t++) pool[t].join();
 		}
 
 		double totalTarget = 0.0;
@@ -7477,72 +7736,36 @@ double SequenceArray::normalizeSequenceIteration(int nlen,int strand,char* normF
 			}
 		}
 
+		{
+			// sequences are independent here; the totals are summed after, in order
+			int nt = numUpd/2048+1;
+			if (nt > threads) nt = threads;
+			auto work = [&](int t) {
+				int lo = (int)(((long long)numUpd*t)/nt);
+				int hi = (int)(((long long)numUpd*(t+1))/nt);
+				if (nl.wide) normReweight<int>(this, nl, upd, lo, hi, normFactors, normFactorsT);
+				else normReweight<unsigned char>(this, nl, upd, lo, hi, normFactors, normFactorsT);
+			};
+			std::vector<std::thread> pool;
+			for (int t=1;t<nt;t++) pool.emplace_back(work, t);
+			work(0);
+			for (size_t t=0;t<pool.size();t++) pool[t].join();
+		}
 		totalBackground = 0.0;
 		totalTarget = 0.0;
 		for (int i=0;i<numSeqs;i++) {
-			char* s = seqs[i]->s;
-			double scoreUnit = (double)seqs[i]->w;
-			if (neutralFlag == 0 && seqs[i]->g == 1) {
-				totalTarget += scoreUnit;
-				continue;
-			}
-			double newScore = 0;
-			int nbins = seqs[i]->length-curLen;
-			double gOligos = (double)totalGood[i];
-			for (int j=0;j<nbins;j++) {
-				int index = 0;
-				int bad = 0;
-				for (int k=0;k<curLen;k++) {
-					if (s[j+k] == 'N') {
-						bad=1;
-						break;
-					}
-					index += alphaIndex[(int)s[j+k]]*pow4[k];
-				}
-				if (bad) continue;
-				if (seqs[i]->g == 1) {
-					newScore += normFactorsT[index];
-				} else {
-					newScore += normFactors[index];
-				}
-			}
-			if (gOligos > 0.5) {
-				newScore /= gOligos;
-			}
-			double newWeight = newScore*scoreUnit;
-			if (newWeight < HOMER_MINIMUM_SEQ_WEIGHT) newWeight = HOMER_MINIMUM_SEQ_WEIGHT;
-			if (newWeight > 1.0/HOMER_MINIMUM_SEQ_WEIGHT) newWeight = 1.0/HOMER_MINIMUM_SEQ_WEIGHT;
-
-			double penalty = newWeight;
-			if (newWeight < 1) penalty = 1/newWeight;
-			penalty*=penalty;
-		
-			double delta = newWeight-seqs[i]->w;
-			double newWeight1 = seqs[i]->w+delta;
-			//double newWeight2 = seqs[i]->w+delta;
-			if (penalty > 1 && ((delta > 0 && newWeight > 1) || (delta < 0 && newWeight < 1))) {
-				newWeight1 = seqs[i]->w+delta/penalty;
+			if (g[i] == 1) {
+				totalTarget += w[i];
 			} else {
-			}
-			//fprintf(stdout, "1\t%lf\t%lf\n",newWeight2,seqs[i]->w);
-			//fprintf(stdout, "%lf\n",penalty);
-			//fprintf(stdout, "%lf\t%lf\n",newWeight2,seqs[i]->w);
-
-			//if (newWeight1 > 4) newWeight1 = 4;
-			//if (newWeight1 < 0.25) newWeight1 = 0.25;
-			
-			seqs[i]->w = newWeight1;
-			if (seqs[i]->g == 1) {
-				totalTarget += seqs[i]->w;
-			} else {
-				totalBackground += seqs[i]->w;
+				totalBackground += w[i];
 			}
 		}
-		numTarget = totalTarget;
-		numBackground = totalBackground;
+		sa->numTarget = totalTarget;
+		sa->numBackground = totalBackground;
 		delete []targetLevels;
 		delete []backgroundLevels;
 		delete []normFactors;
+		delete []normFactorsT;
 		delete []pow4;
 	}
 	if (fp != NULL) {
@@ -7552,11 +7775,52 @@ double SequenceArray::normalizeSequenceIteration(int nlen,int strand,char* normF
 	delete []mer;
 	delete []alphaIndex;
 	delete []alpha;
-	delete []totalGood;
 	delete []neutralFreq;
+	delete []upd;
 
 	return error;
+}
 
+void SequenceArray::normalizeSequence(int nlen,int strand,char* normFile,int neutralFlag,int threads) {
+	if (nlen < 1) return;
+
+	NormState state(this, nlen, threads);
+	double lastError = 1e100;
+	double next = 1.0;
+	double cur = 0.0;
+	
+	for (int i=0;i<maxAutoNormIters;i++) {
+		int printFlag = 0;
+		if (i==0) {
+			printFlag = 1;
+		}
+		double curError = state.iterate(strand,normFile,printFlag,neutralFlag);
+		//double improvementRate = (lastError-curError)/lastError;
+		//fprintf(stderr, "Round %d:\tLastError: %le\tCurrentError:%le\tImprovment:%le\n", i+1,lastError,curError,improvementRate);
+		if (curError >= lastError) break;
+		//if (improvementRate < MIN_OLIGO_NORMALIZATION_IMPROVEMENT) break;
+		lastError = curError;
+		if (printFlag) {
+			fprintf(stderr, "\tConverging on autonormalization solution:\n\t");
+		} else {
+			cur += 80.0/(double)maxAutoNormIters;
+			if (cur > next) {
+				fprintf(stderr, ".");
+				next += 1.0;
+			}
+		}
+	}
+	fprintf(stderr, "\n");
+	fprintf(stderr, "\tFinal normalization:");
+	(void)state.iterate(strand,NULL,1,neutralFlag);
+	state.writeWeights();
+}
+
+double SequenceArray::normalizeSequenceIteration(int nlen,int strand,char* normFile,int printFlag,int neutralFlag) {
+	NormState state(this, nlen, 1);
+	double error = state.iterate(strand,normFile,printFlag,neutralFlag);
+	state.writeWeights();
+	return error;
 }
 
 // ACGTN stay, acgt become ACGT, every other byte becomes N
@@ -7707,7 +7971,7 @@ void KnownMotifs::loadSequence() {
 		seqArray->readSequenceFiles(seqFile,groupFile);
 	}
 	if (normLength > 0 && !findFlag) {
-		seqArray->normalizeSequence(normLength, strand, normFile,neutralFlag);
+		seqArray->normalizeSequence(normLength, strand, normFile,neutralFlag,(int)numCPUs);
 	}
 
 	numTargets = seqArray->numTarget;
