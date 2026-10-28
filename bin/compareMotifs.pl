@@ -7,6 +7,7 @@ my $promoterSeqOffset = -2000;
 
 use POSIX;
 use Statistics;
+use IPC::Open2;
 
 use HomerSVGLogo;
 
@@ -50,6 +51,10 @@ $infoThresh = -1e10;
 
 my $knownFile = $motifDir . "/all/" . "all.motifs";
 my $defaultFile = $knownFile;
+
+# compareMotifsBatch records of each motif against $matchKnown, keyed by motif
+my %matchTable = ();
+my $matchKnown = '';
 
 
 
@@ -243,6 +248,16 @@ if ($reduceMotifFile ne '') {
 }
 
 my $knownMotifs = readMotifFile($knownFile,1e10,-1e10);
+if ($basicFlag == 0) {
+	my $table = compareMotifsBatch($uniqMotifs, $knownMotifs);
+	if (defined($table)) {
+		my $size = 24*scalar(@$knownMotifs);
+		for (my $i=0;$i<@$uniqMotifs;$i++) {
+			$matchTable{$uniqMotifs->[$i]} = substr($table, $i*$size, $size);
+		}
+		$matchKnown = $knownMotifs;
+	}
+}
 printMainPage($uniqMotifs,$knownMotifs, $directory);
 
 
@@ -866,9 +881,15 @@ sub matchMotif {
 	my ($motif, $known) = @_;
 
 	my @results = ();
+	my @batch = ();
+	if (ref($matchKnown) && $matchKnown == $known && exists($matchTable{$motif})) {
+		@batch = unpack("(dl4)*", $matchTable{$motif});
+	}
 	for (my $i=0;$i<@$known;$i++) {
 		my ($score, $offset, $dir, $L) = (0,0,0,0);
-		if ($rehliFlag) {
+		if (@batch && $batch[5*$i+1] != 2) {
+			($score, $offset, $dir, $L) = batchResult(\@batch, $i);
+		} elsif ($rehliFlag) {
 			($score, $offset, $dir, $L) = compareMotifsRehli($motif, $known->[$i]);
 		} else {
 			($score, $offset, $dir, $L) = compareMotifs($motif, $known->[$i]);
@@ -929,6 +950,11 @@ sub reduceMotifs {
 		}
 	}
 
+	my @batch = ();
+	my $table = compareMotifsBatch(\@m);
+	if (defined($table)) {
+		@batch = unpack("(dl4)*", $table);
+	}
 	for (my $i=0;$i<@m;$i++) {
 		if ($i==$lastNUM) {
 			print STDERR "BLAH = $i\n";
@@ -938,9 +964,13 @@ sub reduceMotifs {
 		#print STDERR "$m[$i]->{'name'} $i\n";
 		push(@newList, $m[$i]);
 		for (my $j=$i+1;$j<@m;$j++) {
+			# pair (i,j)'s record in the batch, which holds every pair i<j
+			my $p = $i*scalar(@m) - $i*($i+1)/2 + $j-$i-1;
 			next if ($m[$j]->{'mask'} ==1 && $cmpMatrixFile eq '');
 			my ($s,$o,$d,$L) = (0,0,0,0);
-			if ($rehliFlag) {
+			if (@batch && $batch[5*$p+1] != 2) {
+				($s,$o,$d,$L) = batchResult(\@batch, $p);
+			} elsif ($rehliFlag) {
 				($s,$o,$d,$L) = compareMotifsRehli($m[$i], $m[$j]);
 			} else {
 				($s,$o,$d,$L) = compareMotifs($m[$i], $m[$j]);
@@ -1181,6 +1211,65 @@ sub compareMotifsRehli  {
 	$bestOffset *= -1;
 	#print STDERR "$bestScore\t$bestOffset\t$bestDirection\t$bestLength\n";
 	return ($bestScore, $bestOffset, $bestDirection,$bestLength);
+}
+
+# compareMotifsRehli with the correlation score for many pairs at once, by this
+# install's compareMotifMatrices program on the matrices' numeric values: with
+# $library every (query, library) pair, query-major; without, every pair i<j of
+# @$query. Returns the packed records (score, status, offset, direction,
+# length; status 1 is "NA", 2 a pair left to compareMotifsRehli), or undef when
+# the program is missing or fails, and the caller then compares in Perl.
+sub compareMotifsBatch {
+	my ($query, $library) = @_;
+	return undef if ($scoreMethod ne 'correlation' || $rehliFlag == 0);
+	my $program = $homeDir . "/bin/compareMotifMatrices";
+	return undef if (!-x $program);
+
+	my $nq = scalar(@$query);
+	my $nl = defined($library) ? scalar(@$library) : 0;
+	my $numPairs = defined($library) ? $nq*$nl : $nq*($nq-1)/2;
+	return undef if ($numPairs < 1);
+	my @all = defined($library) ? (@$query, @$library) : @$query;
+	my $data = pack("l4", (defined($library) ? 0 : 1), $norevopp, $nq, $nl);
+	foreach(@all) {
+		$data .= pack("l", $_->{'len'});
+	}
+	foreach(@all) {
+		my $matrix = $_->{'matrix'};
+		for (my $i=0;$i<$_->{'len'};$i++) {
+			$data .= pack("d4", @{$matrix->[$i]});
+		}
+	}
+	my $cpus = int($maxCPUs);
+	$cpus = 1 if ($cpus < 1);
+
+	my ($out, $in);
+	my $pid = eval { open2($out, $in, $program, "-cpu", $cpus) };
+	return undef if (!$pid);
+	binmode($in);
+	binmode($out);
+	{
+		local $SIG{PIPE} = 'IGNORE';
+		print $in $data;
+		close($in);
+	}
+	my $result = '';
+	{
+		local $/;
+		$result = <$out>;
+	}
+	close($out);
+	waitpid($pid, 0);
+	return undef if ($? != 0 || !defined($result) || length($result) != 24*$numPairs);
+	return $result;
+}
+
+# One compareMotifsBatch record, unpacked, as compareMotifsRehli returns it
+sub batchResult {
+	my ($batch, $k) = @_;
+	my $score = $batch->[5*$k];
+	$score = "NA" if ($batch->[5*$k+1] == 1);
+	return ($score, $batch->[5*$k+2], $batch->[5*$k+3], $batch->[5*$k+4]);
 }
 
 sub printMatrix {
