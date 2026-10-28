@@ -987,17 +987,48 @@ if ($cmd->{'find'} eq '') {
 		
 	
 				my $validBgCGBins = $cmd->{'output'} . "/validBgCGBins." . $cmd->{'size'} . ".cgbins";
+				# homerTools bgbins/randbg/filterids replace mergePeaks -cobound, filterListBy.pl,
+				# cat, makeBinaryFile.pl and randRemoveBackground.pl; the old commands run for paths
+				# Perl's 2-argument open would read differently and when homerTools exits non-zero
+				my $fastBins = ($cmd->{'checkOverlaps'} == 1
+					&& perlOpenPlain($bgCGBins, $bgSeq, $targetCGBins, $groupFile, $tmpFile, $tmpFile2));
+				my $opt = "";
+				if ($cmd->{'norevopp'} == 1) {
+					$opt = ' -strand ';
+				}
 				if ($cmd->{'checkOverlaps'} == 1) {
-					my $opt = "";
-					if ($cmd->{'norevopp'} == 1) {
-						$opt = ' -strand ';
+					if (!$fastBins) {
+						`mergePeaks -cobound 1 -prefix $tmpID $opt "$bgCGPos" "$posFileSize"`;
+						`filterListBy.pl "$bgCGBins" "$tmpID.coBoundBy0.txt" 0 1 > "$validBgCGBins"`;
+						`rm "$tmpID.coBoundBy0.txt" "$tmpID.coBoundBy1.txt"`;
 					}
-					`mergePeaks -cobound 1 -prefix $tmpID $opt "$bgCGPos" "$posFileSize"`;
-					`filterListBy.pl "$bgCGBins" "$tmpID.coBoundBy0.txt" 0 1 > "$validBgCGBins"`;
-					`rm "$tmpID.coBoundBy0.txt" "$tmpID.coBoundBy1.txt"`;
 				} else {
 					`cp "$bgCGBins" "$validBgCGBins"`;
 				}
+				my $combineBins = sub {
+					if ($fastBins) {
+						`homerTools bgbins -target "$targetCGBins" -bg "$bgCGBins" -pos "$bgCGPos" -peaks "$posFileSize" -prefix $tmpID $opt -cat "$tmpFile" > "$tmpFile2"`;
+						if ($? != 0) {
+							`mergePeaks -cobound 1 -prefix $tmpID $opt "$bgCGPos" "$posFileSize"`;
+							`homerTools bgbins -target "$targetCGBins" -bg "$bgCGBins" -ids "$tmpID.coBoundBy0.txt" -cat "$tmpFile" > "$tmpFile2"`;
+						}
+					} else {
+						`cat "$targetCGBins" "$validBgCGBins" > "$tmpFile"`;
+						`makeBinaryFile.pl "$tmpFile" "$targetCGBins" > "$tmpFile2"`;
+					}
+				};
+				my $randRemove = sub {
+					my ($binArg) = @_;
+					if ($fastBins) {
+						# the first two rand() values of a fresh perl hold its whole drand48 state
+						my $state = `perl -e 'printf("%.0f %.0f", rand()*2**48, rand()*2**48)'`;
+						if ($state =~ /^\d+ \d+$/) {
+							`homerTools randbg "$tmpFile2" "$cmd->{'numSeq'}" $binArg -perlrand $state > "$tmpFile3"`;
+							return if ($? == 0);
+						}
+					}
+					`randRemoveBackground.pl "$tmpFile2" "$cmd->{'numSeq'}" $binArg > "$tmpFile3"`;
+				};
 		
 				my $wcOutput = `wc -l "$targetCGBins"`;
 				$wcOutput =~ /^\s*(\d+)\s/;
@@ -1014,21 +1045,18 @@ if ($cmd->{'find'} eq '') {
 					#`assignGeneWeights.pl "$tmpFile3" "$tmpFile" > "$groupFile"`;
 				} elsif ($cmd->{'repeats'} == 1) { 
 					print STDERR "\n\tChoosing background that matches in repeat element content...\n";
-					`cat "$targetCGBins" "$validBgCGBins" > "$tmpFile"`;
 					#`wc -l "$tmpFile" "$targetCGBins"`;
-					`makeBinaryFile.pl "$tmpFile" "$targetCGBins" > "$tmpFile2"`;
+					&$combineBins();
 					#`wc -l "$tmpFile2" "$tmpFile"`;
-					`randRemoveBackground.pl "$tmpFile2" "$cmd->{'numSeq'}" "$tmpFile" > "$tmpFile3"`;
+					&$randRemove("\"$tmpFile\"");
 					#`wc -l "$tmpFile3" "$tmpFile"`;
 					`assignGeneWeights.pl "$tmpFile3" "$tmpFile" > "$groupFile"`;
 				} elsif ($cmd->{'cgweight'} == 1) { 
 					print STDERR "\n\tChoosing background that matches in CpG/GC content...\n";
-					`wc -l "$targetCGBins" "$validBgCGBins"`;
-					`cat "$targetCGBins" "$validBgCGBins" > "$tmpFile"`;
 					#`wc -l "$tmpFile" "$targetCGBins"`;
-					`makeBinaryFile.pl "$tmpFile" "$targetCGBins" > "$tmpFile2"`;
+					&$combineBins();
 					#`wc -l "$tmpFile2" "$tmpFile"`;
-					`randRemoveBackground.pl "$tmpFile2" "$cmd->{'numSeq'}" "$tmpFile" > "$tmpFile3"`;
+					&$randRemove("\"$tmpFile\"");
 					#`wc -l "$tmpFile3" "$tmpFile"`;
 					`assignGeneWeights.pl "$tmpFile3" "$tmpFile" > "$groupFile"`;
 				} elsif ($cmd->{'tssweight'} == 1) { 
@@ -1038,20 +1066,27 @@ if ($cmd->{'find'} eq '') {
 					#`assignGeneWeights.pl "$tmpFile3" "$tmpFile" > "$groupFile"`;
 				} else {
 					print STDERR "\tRandomly choosing background...\n";
-					`cat "$targetCGBins" "$validBgCGBins" > "$tmpFile"`;
-					`makeBinaryFile.pl "$tmpFile" "$targetCGBins" > "$tmpFile2"`;
-					`randRemoveBackground.pl "$tmpFile2" "$cmd->{'numSeq'}" null > "$tmpFile3"`;
+					&$combineBins();
+					&$randRemove("null");
 					`cp "$tmpFile3" "$groupFile"`;
 				}
 			
 				print STDERR "\tAssembling sequence file...\n";
-				`filterListBy.pl  "$bgSeq" "$groupFile" 0 1 > "$tmpFile"`;
+				if ($fastBins) {
+					`homerTools filterids "$bgSeq" "$groupFile" > "$tmpFile"`;
+				} else {
+					`filterListBy.pl  "$bgSeq" "$groupFile" 0 1 > "$tmpFile"`;
+				}
 				if ($cmd->{'dumpFasta'}==1) {
 					`tab2fasta.pl "$tmpFile" > "$dumpFastaBackground"`;
 					`tab2fasta.pl "$targetNonRedun" > "$dumpFastaTarget"`;
 				}
 				`cat "$targetNonRedun" "$tmpFile" > "$seqFile"`;
-				`rm "$tmpFile" "$tmpFile2" "$tmpFile3" "$validBgCGBins"`;
+				if ($fastBins) {
+					`rm "$tmpFile" "$tmpFile2" "$tmpFile3" "$tmpID.coBoundBy0.txt" "$tmpID.coBoundBy1.txt"`;
+				} else {
+					`rm "$tmpFile" "$tmpFile2" "$tmpFile3" "$validBgCGBins"`;
+				}
 			}
 			$toDelete{$groupFile}=1;
 			$toDelete{$seqFile}=1;
@@ -1327,6 +1362,15 @@ if ($cmd->{'keepFiles'} == 0) {
 }
 print STDERR "\n";
 exit;
+
+# True when Perl's 2-argument open reads every path as written: no leading or
+# trailing whitespace, no mode characters, not "-".
+sub perlOpenPlain {
+	foreach(@_) {
+		return 0 if ($_ eq '-' || /^\s/ || /\s$/ || /^[<>+|]/ || /\|$/);
+	}
+	return 1;
+}
 
 sub deleteFiles {
 	my ($files) = @_;

@@ -15,6 +15,11 @@
 
 #include "homerTools.h"
 #define _FILE_OFFSET_BITS 64
+#include <stdint.h>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <unordered_map>
 
 void printCMD();
 void printCMDbarcodes();
@@ -31,6 +36,9 @@ void clusterProgram(int argc, char** argv);
 void matrix3DProgram(int argc, char** argv);
 void specialProgram(int argc, char** argv);
 void decontaminateProgram(int argc, char** argv);
+void filterIdsProgram(int argc, char** argv);
+void bgBinsProgram(int argc, char** argv);
+void randBgProgram(int argc, char** argv);
 
 int main(int argc, char** argv) {
 
@@ -57,6 +65,12 @@ int main(int argc, char** argv) {
 		matrix3DProgram(argc,argv);
 	} else if (strcmp(program,"special")==0) {
 		specialProgram(argc,argv);
+	} else if (strcmp(program,"filterids")==0) {
+		filterIdsProgram(argc,argv);
+	} else if (strcmp(program,"bgbins")==0) {
+		bgBinsProgram(argc,argv);
+	} else if (strcmp(program,"randbg")==0) {
+		randBgProgram(argc,argv);
 	} else if (strcmp(program,"--help")==0) {
 		printCMD();
 	} else {
@@ -79,6 +93,9 @@ void printCMD() {
 	fprintf(stderr, "\t\tcluster - hierarchical clustering of a NxN distance matrix\n");
 //	fprintf(stderr, "\t\tmatrix3D - convert distance matrix to 3D coordinates\n");
 	fprintf(stderr, "\t\tspecial - specialized routines (i.e. only really useful for chuck)\n");
+	fprintf(stderr, "\t\tfilterids - keep the lines of a file whose first column is in an ID list\n");
+	fprintf(stderr, "\t\tbgbins - combine target and background bins and mark targets (findMotifsGenome.pl)\n");
+	fprintf(stderr, "\t\trandbg - randRemoveBackground.pl with Perl's rand() stream (findMotifsGenome.pl)\n");
 	fprintf(stderr, "\t\t\n"); 
 	exit(0);
 }
@@ -2099,4 +2116,1068 @@ void matrix3DProgram(int argc, char** argv) {
 	genomeStruct->print(stdout);
 
 
+}
+
+
+
+//---------------------------- filterids / bgbins ---------------------------
+// Byte-exact C++ forms of filterListBy.pl <data> <list> 0 1 and of
+// cat <target bins> <filtered background bins> | makeBinaryFile.pl - <target bins>,
+// as findMotifsGenome.pl runs them. Perl's line handling is reproduced: a line
+// ends at "\n" (a last line without one still counts), every "\r" in it is
+// removed, and its ID is the text before the first tab (empty for an empty
+// line). split /\t/ drops trailing empty fields, so filterListBy.pl prints a
+// kept line with its trailing tabs removed. An input that cannot be opened
+// reads as empty, as Perl's unchecked open does.
+
+#if defined(__GNUC__) || defined(__clang__)
+#define FF_PREFETCH(p) __builtin_prefetch(p)
+#else
+#define FF_PREFETCH(p) ((void)0)
+#endif
+
+class FFLineReader {
+public:
+	FILE* fp;
+	std::vector<char> buf;
+	size_t pos, end;
+	bool eof;
+	FFLineReader(const char* path) {
+		fp = fopen(path, "rb");
+		buf.resize(1 << 22);
+		pos = end = 0;
+		eof = (fp == NULL);
+	}
+	~FFLineReader() {
+		if (fp != NULL) fclose(fp);
+	}
+	// the line stays valid until the next call
+	bool next(const char* &line, size_t &len) {
+		while (1) {
+			if (pos < end) {
+				const char* nl = (const char*)memchr(&(buf[pos]), '\n', end-pos);
+				if (nl != NULL) {
+					line = &(buf[pos]);
+					len = nl - line;
+					pos += len + 1;
+					return true;
+				}
+			}
+			if (eof) {
+				if (pos < end) {
+					line = &(buf[pos]);
+					len = end-pos;
+					pos = end;
+					return true;
+				}
+				return false;
+			}
+			if (pos > 0) {
+				if (end > pos) memmove(&(buf[0]), &(buf[pos]), end-pos);
+				end -= pos;
+				pos = 0;
+			}
+			if (end == buf.size()) buf.resize(buf.size()*2);
+			size_t n = fread(&(buf[end]), 1, buf.size()-end, fp);
+			end += n;
+			if (n == 0) eof = true;
+		}
+	}
+};
+
+static size_t ffFileSize(const char* path) {
+	struct stat st;
+	if (stat(path, &st) != 0) return 0;
+	return (size_t)st.st_size;
+}
+
+static void ffAppendFile(const char* path, std::string &out) {
+	FILE* fp = fopen(path, "rb");
+	if (fp == NULL) return;
+	out.reserve(out.size() + ffFileSize(path) + 1);
+	char rbuf[1 << 16];
+	size_t n = 0;
+	while ((n = fread(rbuf, 1, sizeof(rbuf), fp)) > 0) out.append(rbuf, n);
+	fclose(fp);
+}
+
+static inline uint64_t ffHash(const char* p, size_t n) {
+	uint64_t h = 0x9E3779B97F4A7C15ULL ^ ((uint64_t)n * 0xC2B2AE3D27D4EB4FULL);
+	while (n >= 8) {
+		uint64_t w;
+		memcpy(&w, p, 8);
+		h = (h ^ w) * 0xFF51AFD7ED558CCDULL;
+		h ^= h >> 29;
+		p += 8;
+		n -= 8;
+	}
+	uint64_t w = 0;
+	memcpy(&w, p, n);
+	h = (h ^ w) * 0xC4CEB9FE1A85EC53ULL;
+	h ^= h >> 32;
+	h *= 0xFF51AFD7ED558CCDULL;
+	h ^= h >> 29;
+	return h;
+}
+
+struct FFSlot {
+	uint32_t tag; // 0 = empty
+	uint32_t len;
+	const char* ptr;
+};
+
+// Set of byte strings (open addressing, linear probing). A key is copied into
+// the set's own chunks, or referenced where it outlives the set. Slot numbers
+// change when the table grows.
+class FFKeySet {
+public:
+	std::vector<FFSlot> slots;
+	std::vector<char*> chunks;
+	size_t chunkUsed, chunkSize;
+	size_t mask, count;
+	FFKeySet() {
+		slots.resize(1 << 10);
+		memset(&(slots[0]), 0, slots.size()*sizeof(FFSlot));
+		mask = slots.size()-1;
+		count = chunkUsed = chunkSize = 0;
+	}
+	~FFKeySet() {
+		for (size_t i=0;i<chunks.size();i++) delete [](chunks[i]);
+	}
+	static inline uint32_t tagOf(uint64_t h) {
+		return (uint32_t)(h >> 32) | 1;
+	}
+	void reserve(size_t n) {
+		size_t cap = slots.size();
+		while (cap*7 < n*10) cap *= 2;
+		if (cap != slots.size()) rehash(cap);
+	}
+	void rehash(size_t cap) {
+		std::vector<FFSlot> old;
+		old.swap(slots);
+		slots.resize(cap);
+		memset(&(slots[0]), 0, cap*sizeof(FFSlot));
+		mask = cap-1;
+		for (size_t i=0;i<old.size();i++) {
+			if (old[i].tag == 0) continue;
+			size_t s = ffHash(old[i].ptr, old[i].len) & mask;
+			while (slots[s].tag != 0) s = (s+1) & mask;
+			slots[s] = old[i];
+		}
+	}
+	const char* store(const char* p, size_t n) {
+		if (chunkUsed + n > chunkSize || chunks.size() == 0) {
+			chunkSize = (n > (1 << 22)) ? n : (1 << 22);
+			chunks.push_back(new char[chunkSize]);
+			chunkUsed = 0;
+		}
+		char* d = chunks.back() + chunkUsed;
+		if (n > 0) memcpy(d, p, n);
+		chunkUsed += n;
+		return d;
+	}
+	inline void prefetch(uint64_t h) {
+		FF_PREFETCH(&(slots[h & mask]));
+	}
+	// the first slot at or after s that is empty or holds a key of this tag and length
+	inline size_t probe(size_t s, uint32_t tag, size_t n) {
+		while (slots[s].tag != 0 && (slots[s].tag != tag || slots[s].len != n)) s = (s+1) & mask;
+		return s;
+	}
+	// slot of the key, or -1
+	long long find(const char* p, size_t n, uint64_t h) {
+		uint32_t tag = tagOf(h);
+		size_t s = probe(h & mask, tag, n);
+		while (slots[s].tag != 0) {
+			if (memcmp(slots[s].ptr, p, n) == 0) return (long long)s;
+			s = probe((s+1) & mask, tag, n);
+		}
+		return -1;
+	}
+	long long find(const char* p, size_t n) {
+		return find(p, n, ffHash(p, n));
+	}
+	// slot of the key (valid until the table grows); isNew says whether it was added
+	size_t insert(const char* p, size_t n, uint64_t h, bool copy, bool &isNew) {
+		if (n > 0xFFFFFFFFULL) {
+			fprintf(stderr, "!!! ID too long !!!\n");
+			exit(1);
+		}
+		long long f = find(p, n, h);
+		if (f >= 0) {
+			isNew = false;
+			return (size_t)f;
+		}
+		isNew = true;
+		if ((count+1)*10 > slots.size()*7) rehash(slots.size()*2);
+		size_t s = h & mask;
+		while (slots[s].tag != 0) s = (s+1) & mask;
+		slots[s].tag = tagOf(h);
+		slots[s].len = (uint32_t)n;
+		slots[s].ptr = copy ? store(p, n) : p;
+		count++;
+		return s;
+	}
+	size_t insert(const char* p, size_t n, bool copy, bool &isNew) {
+		return insert(p, n, ffHash(p, n), copy, isNew);
+	}
+};
+
+// The ID of a line: the text before the first tab, with every "\r" removed.
+// When a "\r" is removed the ID is built in scratch.
+static inline void ffLineKey(const char* line, size_t len, std::string &scratch,
+						const char* &key, size_t &klen) {
+	const char* tab = (const char*)memchr(line, '\t', len);
+	klen = (tab != NULL) ? (size_t)(tab-line) : len;
+	key = line;
+	if (klen == 0 || memchr(line, '\r', klen) == NULL) return;
+	scratch.clear();
+	for (size_t i=0;i<klen;i++) if (line[i] != '\r') scratch.push_back(line[i]);
+	key = scratch.data();
+	klen = scratch.size();
+}
+
+// filterListBy.pl's printed form of a kept line, without the "\n": "\r"
+// removed, trailing tabs dropped.
+static inline void ffAppendFields(std::string &out, const char* line, size_t len) {
+	size_t start = out.size();
+	if (len > 0 && memchr(line, '\r', len) != NULL) {
+		for (size_t i=0;i<len;i++) if (line[i] != '\r') out.push_back(line[i]);
+	} else {
+		out.append(line, len);
+	}
+	size_t e = out.size();
+	while (e > start && out[e-1] == '\t') e--;
+	out.resize(e);
+}
+
+static void ffFlush(std::string &out, FILE* fp, size_t keep) {
+	if (out.size() < keep) return;
+	if (out.size() > 0) fwrite(out.data(), 1, out.size(), fp);
+	out.clear();
+}
+
+static void ffReadIds(const char* path, FFKeySet &ids) {
+	ids.reserve(ffFileSize(path)/48);
+	FFLineReader in(path);
+	const int B = 16;
+	const char* kp[B];
+	size_t kn[B];
+	uint64_t kh[B];
+	std::string scratch;
+	bool more = true, isNew = false;
+	while (more) {
+		int nb = 0;
+		const char* line = NULL;
+		size_t len = 0;
+		while (nb < B && (more = in.next(line, len))) {
+			const char* key = NULL;
+			size_t klen = 0;
+			ffLineKey(line, len, scratch, key, klen);
+			kp[nb] = ids.store(key, klen);
+			kn[nb] = klen;
+			kh[nb] = ffHash(kp[nb], klen);
+			ids.prefetch(kh[nb]);
+			nb++;
+		}
+		for (int i=0;i<nb;i++) ids.insert(kp[i], kn[i], kh[i], false, isNew);
+	}
+}
+
+void printCMDfilterids() {
+	fprintf(stderr, "\n\tUsage: homerTools filterids <data file> <ID list file>\n");
+	fprintf(stderr, "\n\tPrints to stdout the lines of <data file> whose first tab-separated column is the\n");
+	fprintf(stderr, "\tfirst column of a line in <ID list file>, with carriage returns and trailing tabs\n");
+	fprintf(stderr, "\tremoved: the output of filterListBy.pl <data file> <ID list file> 0 1\n");
+	fprintf(stderr, "\n");
+	exit(0);
+}
+
+void filterIdsProgram(int argc, char** argv) {
+	if (argc < 4) printCMDfilterids();
+	FFKeySet ids;
+	ffReadIds(argv[3], ids);
+	FFLineReader in(argv[2]);
+	const char* line = NULL;
+	size_t len = 0;
+	std::string out, scratch;
+	while (in.next(line, len)) {
+		const char* key = NULL;
+		size_t klen = 0;
+		ffLineKey(line, len, scratch, key, klen);
+		if (ids.find(key, klen) >= 0) {
+			ffAppendFields(out, line, len);
+			out.push_back('\n');
+			ffFlush(out, stdout, 1 << 22);
+		}
+	}
+	ffFlush(out, stdout, 0);
+	fflush(stdout);
+}
+
+// The ID list of `mergePeaks -cobound 1 -prefix <prefix> [-strand] <pos> <peaks>`'s
+// coBoundBy0.txt, as filterListBy.pl reads it: the IDs of the header line, and
+// the name of every <pos> peak that overlaps no <peaks> peak (closed intervals,
+// same chromosome, and same strand with -strand). Peak lines are classified
+// as PeakLibrary::readPeakFile classifies them. Returns false, having read
+// only, when mergePeaks could behave in a way this does not reproduce: an
+// argument mergePeaks reads as an option or as the same file, an output it
+// cannot open, a NUL or carriage return, a line longer than its fgets buffer,
+// a BED-format line, a coordinate sscanf would not read exactly, a peak with
+// start > end, a repeated name (mergePeaks renames it), target names longer in
+// total than its overlap string, or a file with no peaks. ids holds every
+// <pos> name and the header IDs; keep[slot] marks the coBoundBy0 IDs.
+
+#define FF_PEAK_SKIP 0
+#define FF_PEAK_OK 1
+#define FF_PEAK_UNSUPPORTED 2
+// the longest line SeqTag.cpp's fgets(buf, 100000) returns whole, with margin
+#define FF_PEAK_MAX_LINE 99997
+
+struct FFPeak {
+	const char* name;
+	size_t nameLen;
+	const char* chr;
+	size_t chrLen;
+	int start, end, dir;
+};
+
+// SeqTag.cpp's checkInt on one column
+static int ffCheckInt(const char* s, size_t n) {
+	int bad = 0;
+	for (size_t i=0;i<n;i++) {
+		if (s[i] < 45) bad=1;
+		if (s[i] == 46 || s[i] == 47) bad=1;
+		if (s[i] > 57) bad=1;
+	}
+	return bad;
+}
+
+// SeqTag.cpp's checkStrand on one column
+static int ffCheckStrand(const char* s, size_t n) {
+	if (n != 1) return -1;
+	if (s[0] == '0' || s[0] == '+' || s[0] == '.') return 0;
+	if (s[0] == '1' || s[0] == '-') return 1;
+	return -1;
+}
+
+// -?[0-9]{1,9}, which sscanf("%d") reads exactly
+static bool ffPlainInt(const char* s, size_t n, int &v) {
+	size_t i = 0;
+	bool neg = false;
+	if (n > 0 && s[0] == '-') {
+		neg = true;
+		i = 1;
+	}
+	if (n-i < 1 || n-i > 9) return false;
+	int x = 0;
+	for (;i<n;i++) {
+		if (s[i] < '0' || s[i] > '9') return false;
+		x = x*10 + (s[i]-'0');
+	}
+	v = neg ? -x : x;
+	return true;
+}
+
+// One line (no "\n", "\r" or NUL) as PeakLibrary::readPeakFile in
+// PEAK_READ_MODE_NORMAL reads it. Only columns 0-4 decide, and a line with
+// five or more columns is treated alike.
+static int ffPeakLine(const char* s, size_t len, FFPeak &pk) {
+	const char* c[5];
+	size_t cn[5];
+	int numCols = 0;
+	const char* e = s + len;
+	const char* p = s;
+	while (numCols < 5) {
+		const char* t = (const char*)memchr(p, '\t', e-p);
+		c[numCols] = p;
+		cn[numCols] = ((t != NULL) ? t : e) - p;
+		numCols++;
+		if (t == NULL) break;
+		p = t+1;
+	}
+	if (numCols < 3) return FF_PEAK_SKIP;
+	if (cn[0] > 0 && c[0][0] == '#') return FF_PEAK_SKIP;
+	char c2 = (cn[2] > 0) ? c[2][0] : '\0';
+	if (c2 != '-' && (c2 < 48 || c2 > 57)) return FF_PEAK_SKIP;
+	int col1notNum = ffCheckInt(c[1], cn[1]);
+	if (ffCheckInt(c[2], cn[2])) return FF_PEAK_SKIP;
+	int dir = -1;
+	if (numCols == 3) {
+		if (col1notNum) return FF_PEAK_SKIP;
+		return FF_PEAK_UNSUPPORTED;
+	}
+	int col3notNum = ffCheckInt(c[3], cn[3]);
+	if (col1notNum && col3notNum) return FF_PEAK_SKIP;
+	if (numCols == 4) {
+		if (col3notNum) return FF_PEAK_UNSUPPORTED;
+	} else {
+		int col4strand = ffCheckStrand(c[4], cn[4]);
+		if (col4strand != -1 && col3notNum == 0) {
+			dir = col4strand;
+		} else if (col3notNum) {
+			return FF_PEAK_UNSUPPORTED;
+		} else {
+			return FF_PEAK_SKIP;
+		}
+	}
+	if (!ffPlainInt(c[2], cn[2], pk.start) || !ffPlainInt(c[3], cn[3], pk.end)) return FF_PEAK_UNSUPPORTED;
+	if (pk.start > pk.end) return FF_PEAK_UNSUPPORTED;
+	pk.name = c[0];
+	pk.nameLen = cn[0];
+	pk.chr = c[1];
+	pk.chrLen = cn[1];
+	pk.dir = (dir == -1) ? 0 : dir;
+	return FF_PEAK_OK;
+}
+
+// the next line of buf from p ("\n" removed; a last line without one counts)
+static inline bool ffNextLine(const std::string &buf, size_t &p, const char* &line, size_t &len) {
+	if (p >= buf.size()) return false;
+	line = buf.data() + p;
+	const char* nl = (const char*)memchr(line, '\n', buf.size()-p);
+	len = (nl != NULL) ? (size_t)(nl-line) : buf.size()-p;
+	p += len + 1;
+	return true;
+}
+
+struct FFTargetChr {
+	std::vector<std::pair<int,int> > iv[2];
+	std::vector<int> start[2];
+	std::vector<int> maxEnd[2];
+};
+
+static bool ffCoboundIds(const char* posFile, const char* peaksFile, const char* prefix,
+				bool strandSep, std::string &posBuf, FFKeySet &ids, std::vector<char> &keep) {
+	if (posFile[0] == '-' || peaksFile[0] == '-' || strcmp(posFile, peaksFile) == 0) return false;
+
+	std::string tbuf;
+	ffAppendFile(peaksFile, tbuf);
+	if (memchr(tbuf.data(), '\0', tbuf.size()) != NULL || memchr(tbuf.data(), '\r', tbuf.size()) != NULL) return false;
+	std::unordered_map<std::string,int> chrIndex;
+	std::vector<FFTargetChr> tchr;
+	FFKeySet tnames;
+	size_t nameBytes = 0, numTargets = 0, p = 0;
+	const char* line = NULL;
+	size_t len = 0;
+	bool isNew = false;
+	while (ffNextLine(tbuf, p, line, len)) {
+		if (len > FF_PEAK_MAX_LINE) return false;
+		FFPeak pk;
+		int r = ffPeakLine(line, len, pk);
+		if (r == FF_PEAK_SKIP) continue;
+		if (r == FF_PEAK_UNSUPPORTED) return false;
+		tnames.insert(pk.name, pk.nameLen, false, isNew);
+		if (!isNew) return false;
+		// getCoBoundPeaks joins a peak's overlapping target names into a 1,000,000-byte string
+		nameBytes += pk.nameLen + 1;
+		if (nameBytes > 900000) return false;
+		std::string chr(pk.chr, pk.chrLen);
+		std::unordered_map<std::string,int>::iterator it = chrIndex.find(chr);
+		int ci = 0;
+		if (it == chrIndex.end()) {
+			ci = (int)tchr.size();
+			chrIndex[chr] = ci;
+			tchr.push_back(FFTargetChr());
+		} else {
+			ci = it->second;
+		}
+		tchr[ci].iv[strandSep ? pk.dir : 0].push_back(std::make_pair(pk.start, pk.end));
+		numTargets++;
+	}
+	if (numTargets == 0) return false;
+	for (size_t i=0;i<tchr.size();i++) {
+		for (int k=0;k<2;k++) {
+			std::vector<std::pair<int,int> > &iv = tchr[i].iv[k];
+			std::sort(iv.begin(), iv.end());
+			int m = INT_MIN;
+			for (size_t j=0;j<iv.size();j++) {
+				if (iv[j].second > m) m = iv[j].second;
+				tchr[i].start[k].push_back(iv[j].first);
+				tchr[i].maxEnd[k].push_back(m);
+			}
+		}
+	}
+
+	std::string cmd = std::string("mergePeaks -cobound 1 -prefix ") + prefix
+					+ (strandSep ? " -strand " : " ") + posFile + " " + peaksFile;
+	std::string header = "#Name (cmd = " + cmd + ")\tchr\tstart\tend\tstrand\tstat\tstat2\t"
+					+ peaksFile + "\n";
+	size_t headerLines = 0;
+	for (size_t i=0;i<header.size();i++) if (header[i] == '\n') headerLines++;
+
+	ffAppendFile(posFile, posBuf);
+	if (memchr(posBuf.data(), '\0', posBuf.size()) != NULL || memchr(posBuf.data(), '\r', posBuf.size()) != NULL) return false;
+	size_t numLines = 1;
+	for (const char* q = posBuf.data(); (q = (const char*)memchr(q, '\n', posBuf.data()+posBuf.size()-q)) != NULL; q++) numLines++;
+	ids.reserve(numLines + headerLines + 16);
+	keep.assign(ids.slots.size(), 0);
+
+	const int B = 16;
+	const char* kp[B];
+	size_t kn[B];
+	uint64_t kh[B];
+	char ovl[B];
+	size_t numRef = 0;
+	const char* lastChr = NULL;
+	size_t lastChrLen = 0;
+	int lastCi = -1;
+	p = 0;
+	bool more = true;
+	while (more) {
+		int nb = 0;
+		while (nb < B && (more = ffNextLine(posBuf, p, line, len))) {
+			if (len > FF_PEAK_MAX_LINE) return false;
+			FFPeak pk;
+			int r = ffPeakLine(line, len, pk);
+			if (r == FF_PEAK_SKIP) continue;
+			if (r == FF_PEAK_UNSUPPORTED) return false;
+			if (lastChr == NULL || pk.chrLen != lastChrLen || memcmp(pk.chr, lastChr, lastChrLen) != 0) {
+				std::unordered_map<std::string,int>::iterator it = chrIndex.find(std::string(pk.chr, pk.chrLen));
+				lastCi = (it == chrIndex.end()) ? -1 : it->second;
+				lastChr = pk.chr;
+				lastChrLen = pk.chrLen;
+			}
+			char o = 0;
+			if (lastCi >= 0) {
+				int k = strandSep ? pk.dir : 0;
+				const std::vector<int> &st = tchr[lastCi].start[k];
+				size_t j = std::upper_bound(st.begin(), st.end(), pk.end) - st.begin();
+				if (j > 0 && tchr[lastCi].maxEnd[k][j-1] >= pk.start) o = 1;
+			}
+			kp[nb] = pk.name;
+			kn[nb] = pk.nameLen;
+			kh[nb] = ffHash(pk.name, pk.nameLen);
+			ovl[nb] = o;
+			ids.prefetch(kh[nb]);
+			nb++;
+		}
+		for (int i=0;i<nb;i++) {
+			size_t s = ids.insert(kp[i], kn[i], kh[i], false, isNew);
+			if (!isNew) return false;
+			keep[s] = !ovl[i];
+		}
+		numRef += nb;
+	}
+	if (numRef == 0) return false;
+
+	std::string scratch;
+	size_t hp = 0;
+	while (ffNextLine(header, hp, line, len)) {
+		const char* key = NULL;
+		size_t klen = 0;
+		ffLineKey(line, len, scratch, key, klen);
+		size_t s = ids.insert(key, klen, true, isNew);
+		keep[s] = 1;
+	}
+	if (keep.size() != ids.slots.size()) {
+		fprintf(stderr, "!!! bgbins: ID table grew past its reserve !!!\n");
+		exit(1);
+	}
+	// mergePeaks creates its two outputs last, and fails when it cannot
+	for (int i=0;i<2;i++) {
+		std::string fname = std::string(prefix) + ((i == 0) ? ".coBoundBy0.txt" : ".coBoundBy1.txt");
+		FILE* fp = fopen(fname.c_str(), "w");
+		if (fp == NULL) return false;
+		fclose(fp);
+	}
+	return true;
+}
+
+void printCMDbgbins() {
+	fprintf(stderr, "\n\tUsage: homerTools bgbins -target <target bins> -bg <background bins> -ids <ID list file> -cat <output file>\n");
+	fprintf(stderr, "\t   or: homerTools bgbins -target <target bins> -bg <background bins> -pos <pos file> -peaks <peak file>\n");
+	fprintf(stderr, "\t                         -prefix <prefix> [-strand] -cat <output file>\n");
+	fprintf(stderr, "\n\tWrites to -cat the target bins file followed by the lines of the background bins\n");
+	fprintf(stderr, "\tfile whose ID is in -ids, as filterListBy.pl <bg> <ids> 0 1 prints them, and prints\n");
+	fprintf(stderr, "\tto stdout what makeBinaryFile.pl <-cat file> <target bins> prints.\n");
+	fprintf(stderr, "\tWith -pos/-peaks the ID list is the <prefix>.coBoundBy0.txt file that\n");
+	fprintf(stderr, "\tmergePeaks -cobound 1 -prefix <prefix> [-strand] <pos file> <peak file> would write\n");
+	fprintf(stderr, "\t(the two coBoundBy files are created empty); exits with status 2, having written\n");
+	fprintf(stderr, "\tnothing, when the inputs need mergePeaks itself.\n");
+	fprintf(stderr, "\n");
+	exit(0);
+}
+
+void bgBinsProgram(int argc, char** argv) {
+	const char* targetFile = NULL;
+	const char* bgFile = NULL;
+	const char* idFile = NULL;
+	const char* catFile = NULL;
+	const char* posFile = NULL;
+	const char* peaksFile = NULL;
+	const char* prefix = NULL;
+	bool strandSep = false;
+	for (int i=2;i<argc;i++) {
+		if (strcmp(argv[i],"-strand")==0) {
+			strandSep = true;
+			continue;
+		}
+		if (i+1 >= argc) printCMDbgbins();
+		if (strcmp(argv[i],"-target")==0) {
+			targetFile = argv[++i];
+		} else if (strcmp(argv[i],"-bg")==0) {
+			bgFile = argv[++i];
+		} else if (strcmp(argv[i],"-ids")==0) {
+			idFile = argv[++i];
+		} else if (strcmp(argv[i],"-cat")==0) {
+			catFile = argv[++i];
+		} else if (strcmp(argv[i],"-pos")==0) {
+			posFile = argv[++i];
+		} else if (strcmp(argv[i],"-peaks")==0) {
+			peaksFile = argv[++i];
+		} else if (strcmp(argv[i],"-prefix")==0) {
+			prefix = argv[++i];
+		} else {
+			printCMDbgbins();
+		}
+	}
+	if (targetFile == NULL || bgFile == NULL || catFile == NULL) printCMDbgbins();
+	bool coboundFlag = (posFile != NULL || peaksFile != NULL || prefix != NULL);
+	if (coboundFlag && (posFile == NULL || peaksFile == NULL || prefix == NULL || idFile != NULL)) printCMDbgbins();
+	if (!coboundFlag && idFile == NULL) printCMDbgbins();
+
+	// built before anything is written, so that status 2 leaves no output
+	FFKeySet ids;
+	std::vector<char> keep;
+	std::string posBuf;
+	if (coboundFlag) {
+		if (!ffCoboundIds(posFile, peaksFile, prefix, strandSep, posBuf, ids, keep)) exit(2);
+	} else {
+		ffReadIds(idFile, ids);
+		keep.assign(ids.slots.size(), 1);
+	}
+
+	// makeBinaryFile.pl <target + kept background> <target> prints each first
+	// occurrence of an ID in the combined lines, with 1 if it is a target ID
+	// (the ID of any target line) and 0 if not, then the target IDs never met.
+	// Target lines come first, so every target ID but the last line's is met
+	// there. The last target line, when it has no "\n", merges with the first
+	// kept background line.
+	std::string combined, out, scratch;
+	ffAppendFile(targetFile, combined);
+	size_t targetBytes = combined.size();
+	FFKeySet targetDone;
+	bool isNew = false;
+	size_t p = 0;
+	while (p < targetBytes) {
+		const char* nl = (const char*)memchr(combined.data()+p, '\n', targetBytes-p);
+		if (nl == NULL) break;
+		size_t len = nl - (combined.data()+p);
+		const char* key = NULL;
+		size_t klen = 0;
+		ffLineKey(combined.data()+p, len, scratch, key, klen);
+		targetDone.insert(key, klen, true, isNew);
+		if (isNew) {
+			out.append(key, klen);
+			out.append("\t1\n");
+		}
+		p += len + 1;
+	}
+	ffFlush(out, stdout, 0);
+	bool hasTail = (p < targetBytes);
+	std::string tail, tailKey;
+	bool tailSeen = false;
+	if (hasTail) {
+		tail.assign(combined.data()+p, targetBytes-p);
+		const char* key = NULL;
+		size_t klen = 0;
+		ffLineKey(tail.data(), tail.size(), scratch, key, klen);
+		tailKey.assign(key, klen);
+		tailSeen = (targetDone.find(tailKey.data(), tailKey.size()) >= 0);
+	}
+
+	// done[slot]: the ID was already printed
+	std::vector<char> done(ids.slots.size(), 0);
+	for (size_t i=0;i<targetDone.slots.size();i++) {
+		if (targetDone.slots[i].tag == 0) continue;
+		long long s = ids.find(targetDone.slots[i].ptr, targetDone.slots[i].len);
+		if (s >= 0) done[s] = 1;
+	}
+
+	std::string bg;
+	ffAppendFile(bgFile, bg);
+	combined.reserve(targetBytes + bg.size() + 1);
+	bool first = true;
+	const int B = 16;
+	const char* lp[B];
+	size_t ln[B];
+	const char* kp[B];
+	size_t kn[B];
+	uint64_t kh[B];
+	size_t cand[B];
+	std::string kscratch[B];
+	const char* bp = bg.data();
+	const char* bend = bp + bg.size();
+	while (bp < bend) {
+		int nb = 0;
+		while (nb < B && bp < bend) {
+			const char* nl = (const char*)memchr(bp, '\n', bend-bp);
+			size_t len = (nl != NULL) ? (size_t)(nl-bp) : (size_t)(bend-bp);
+			lp[nb] = bp;
+			ln[nb] = len;
+			ffLineKey(bp, len, kscratch[nb], kp[nb], kn[nb]);
+			kh[nb] = ffHash(kp[nb], kn[nb]);
+			ids.prefetch(kh[nb]);
+			bp += len + 1;
+			nb++;
+		}
+		for (int i=0;i<nb;i++) {
+			cand[i] = ids.probe(kh[i] & ids.mask, FFKeySet::tagOf(kh[i]), kn[i]);
+			if (ids.slots[cand[i]].tag != 0) FF_PREFETCH(ids.slots[cand[i]].ptr);
+		}
+		for (int i=0;i<nb;i++) {
+			size_t s = cand[i];
+			while (ids.slots[s].tag != 0 && memcmp(ids.slots[s].ptr, kp[i], kn[i]) != 0) {
+				s = ids.probe((s+1) & ids.mask, FFKeySet::tagOf(kh[i]), kn[i]);
+			}
+			if (ids.slots[s].tag == 0 || !keep[s]) continue;
+			size_t start = combined.size();
+			ffAppendFields(combined, lp[i], ln[i]);
+			combined.push_back('\n');
+			if (first && hasTail) {
+				// the merged line: the last target line, then this one
+				std::string merged = tail;
+				merged.append(combined.data()+start, combined.size()-1-start);
+				const char* key = NULL;
+				size_t klen = 0;
+				ffLineKey(merged.data(), merged.size(), scratch, key, klen);
+				targetDone.insert(key, klen, true, isNew);
+				if (isNew) {
+					bool special = (klen == tailKey.size() && memcmp(key, tailKey.data(), klen) == 0);
+					if (special) tailSeen = true;
+					out.append(key, klen);
+					out.append(special ? "\t1\n" : "\t0\n");
+					long long m = ids.find(key, klen);
+					if (m >= 0) done[m] = 1;
+				}
+			} else if (done[s] == 0) {
+				done[s] = 1;
+				bool special = (hasTail && kn[i] == tailKey.size() && memcmp(kp[i], tailKey.data(), kn[i]) == 0);
+				if (special) tailSeen = true;
+				out.append(kp[i], kn[i]);
+				out.append(special ? "\t1\n" : "\t0\n");
+			}
+			first = false;
+			ffFlush(out, stdout, 1 << 22);
+		}
+	}
+	if (hasTail && first) {
+		// no background line kept: the last target line ends the combined file
+		if (targetDone.find(tailKey.data(), tailKey.size()) < 0) {
+			out.append(tailKey);
+			out.append("\t1\n");
+		}
+		tailSeen = true;
+	}
+	if (hasTail && !tailSeen) {
+		out.append(tailKey);
+		out.append("\t1\n");
+	}
+	ffFlush(out, stdout, 0);
+	fflush(stdout);
+
+	FILE* fp = fopen(catFile, "wb");
+	if (fp == NULL) {
+		fprintf(stderr, "!!! Could not open %s for writing !!!\n", catFile);
+		exit(1);
+	}
+	if (combined.size() > 0) fwrite(combined.data(), 1, combined.size(), fp);
+	fclose(fp);
+}
+
+
+
+//---------------------------- randbg ---------------------------
+// randRemoveBackground.pl <group file> <total> <bins file | null> in C++, drawing
+// Perl's rand() stream. Perl 5.20 and later draw rand() from their own
+// drand48 on every platform: state = (state*0x5DEECE66D + 0xB) mod 2^48, value =
+// state/2^48. -perlrand gives the first two values a fresh perl process draws,
+// times 2^48 (findMotifsGenome.pl asks perl for them), which is the whole state.
+// randbg exits with status 2, having printed nothing, when it cannot reproduce
+// the script: the two values are not consecutive drand48 states, <total> is
+// not a plain integer, a group line whose ID is in the bins has a second column
+// other than 0 or 1, such an ID repeats, or its bin is not a plain integer
+// (Perl would order bins of equal value by hash order).
+
+static const uint64_t FF_DRAND_A = 0x5DEECE66DULL;
+static const uint64_t FF_DRAND_C = 0xBULL;
+static const uint64_t FF_DRAND_MASK = (1ULL << 48) - 1;
+static const long long FF_BIN_NONE = LLONG_MIN;
+
+class FFPerlRand {
+public:
+	uint64_t x;
+	bool first;
+	FFPerlRand(uint64_t x1) {
+		x = x1;
+		first = true;
+	}
+	inline double next() {
+		if (first) {
+			first = false;
+		} else {
+			x = (x*FF_DRAND_A + FF_DRAND_C) & FF_DRAND_MASK;
+		}
+		return ldexp((double)x, -48);
+	}
+};
+
+// [0-9]{1,15}
+static bool ffUnsignedArg(const char* s, unsigned long long &v) {
+	size_t n = strlen(s);
+	if (n < 1 || n > 15) return false;
+	v = 0;
+	for (size_t i=0;i<n;i++) {
+		if (s[i] < '0' || s[i] > '9') return false;
+		v = v*10 + (unsigned long long)(s[i]-'0');
+	}
+	return true;
+}
+
+// 0 or -?[1-9][0-9]{0,14}: distinct strings have distinct numeric values
+static long long ffCanonicalInt(const char* s, size_t n) {
+	if (n == 1 && s[0] == '0') return 0;
+	size_t i = 0;
+	bool neg = false;
+	if (n > 0 && s[0] == '-') {
+		neg = true;
+		i = 1;
+	}
+	if (n-i < 1 || n-i > 15 || s[i] == '0') return FF_BIN_NONE;
+	long long v = 0;
+	for (;i<n;i++) {
+		if (s[i] < '0' || s[i] > '9') return FF_BIN_NONE;
+		v = v*10 + (s[i]-'0');
+	}
+	return neg ? -v : v;
+}
+
+// Perl's chomp; s/\r//g; split /\t/ for the first two fields. Carriage returns
+// are already removed from buf. has1 is false when split gives no second field.
+static inline void ffTwoFields(const char* line, size_t len, const char* &f0, size_t &n0,
+							const char* &f1, size_t &n1, bool &has1) {
+	const char* tab = (const char*)memchr(line, '\t', len);
+	f0 = line;
+	n0 = (tab != NULL) ? (size_t)(tab-line) : len;
+	has1 = false;
+	f1 = NULL;
+	n1 = 0;
+	if (tab == NULL) return;
+	f1 = tab+1;
+	const char* e = line + len;
+	const char* tab2 = (const char*)memchr(f1, '\t', e-f1);
+	n1 = ((tab2 != NULL) ? tab2 : e) - f1;
+	has1 = true;
+}
+
+static void ffReadNoCR(const char* path, std::string &buf) {
+	ffAppendFile(path, buf);
+	if (memchr(buf.data(), '\r', buf.size()) != NULL) {
+		buf.erase(std::remove(buf.begin(), buf.end(), '\r'), buf.end());
+	}
+}
+
+struct FFRandBin {
+	long long value;
+	long long numPos;
+	std::vector<std::pair<const char*, size_t> > back;
+};
+
+void printCMDrandbg() {
+	fprintf(stderr, "\n\tUsage: homerTools randbg <group file> <total # of sequences> <bins file | null> -perlrand <x1> <x2>\n");
+	fprintf(stderr, "\n\tPrints what randRemoveBackground.pl <group file> <total> <bins file | null> prints when\n");
+	fprintf(stderr, "\tPerl's rand() would first return x1/2^48 and x2/2^48 (perl -e 'printf(\"%%.0f %%.0f\",\n");
+	fprintf(stderr, "\trand()*2**48, rand()*2**48)' gives them). Exits with status 2, printing nothing, when\n");
+	fprintf(stderr, "\tit cannot reproduce the script on these inputs.\n");
+	fprintf(stderr, "\n");
+	exit(0);
+}
+
+static int ffRandBg(const char* groupFile, const char* maxArg, const char* binsFile,
+					const char* x1Arg, const char* x2Arg, std::string &out) {
+	unsigned long long x1 = 0, x2 = 0, maxv = 0;
+	if (!ffUnsignedArg(x1Arg, x1) || !ffUnsignedArg(x2Arg, x2)) return 2;
+	if (x1 > FF_DRAND_MASK || x2 > FF_DRAND_MASK) return 2;
+	if (((x1*FF_DRAND_A + FF_DRAND_C) & FF_DRAND_MASK) != x2) return 2;
+	if (!ffUnsignedArg(maxArg, maxv)) return 2;
+
+	std::string groupBuf, binsBuf;
+	ffReadNoCR(groupFile, groupBuf);
+	bool nullBins = (strcmp(binsFile, "null") == 0);
+	if (!nullBins) ffReadNoCR(binsFile, binsBuf);
+	const std::string &setBuf = nullBins ? groupBuf : binsBuf;
+
+	// $bins{ID}: the last line's second field wins
+	FFKeySet bins;
+	size_t numLines = 1;
+	for (const char* q = setBuf.data(); (q = (const char*)memchr(q, '\n', setBuf.data()+setBuf.size()-q)) != NULL; q++) numLines++;
+	bins.reserve(numLines + 16);
+	std::vector<long long> binValue(bins.slots.size(), FF_BIN_NONE);
+	std::vector<char> used(bins.slots.size(), 0);
+	const int B = 16;
+	const char* kp[B];
+	size_t kn[B];
+	uint64_t kh[B];
+	long long kv[B];
+	const char* fp1[B];
+	size_t fn1[B];
+	bool fh1[B];
+	size_t cand[B];
+	const char* line = NULL;
+	size_t len = 0, p = 0;
+	bool isNew = false, more = true;
+	while (more) {
+		int nb = 0;
+		while (nb < B && (more = ffNextLine(setBuf, p, line, len))) {
+			const char *f1;
+			size_t n1;
+			bool has1;
+			ffTwoFields(line, len, kp[nb], kn[nb], f1, n1, has1);
+			kv[nb] = nullBins ? 1 : (has1 ? ffCanonicalInt(f1, n1) : FF_BIN_NONE);
+			kh[nb] = ffHash(kp[nb], kn[nb]);
+			bins.prefetch(kh[nb]);
+			nb++;
+		}
+		for (int i=0;i<nb;i++) {
+			size_t s = bins.insert(kp[i], kn[i], kh[i], false, isNew);
+			binValue[s] = kv[i];
+		}
+	}
+	if (binValue.size() != bins.slots.size()) {
+		fprintf(stderr, "!!! randbg: ID table grew past its reserve !!!\n");
+		exit(1);
+	}
+
+	std::vector<FFRandBin> binList;
+	std::unordered_map<long long,int> binIndex;
+	std::vector<int> smallBin(4096, -1);
+	long long n = 0;
+	p = 0;
+	more = true;
+	while (more) {
+		int nb = 0;
+		while (nb < B && (more = ffNextLine(groupBuf, p, line, len))) {
+			ffTwoFields(line, len, kp[nb], kn[nb], fp1[nb], fn1[nb], fh1[nb]);
+			kh[nb] = ffHash(kp[nb], kn[nb]);
+			bins.prefetch(kh[nb]);
+			nb++;
+		}
+		for (int i=0;i<nb;i++) {
+			cand[i] = bins.probe(kh[i] & bins.mask, FFKeySet::tagOf(kh[i]), kn[i]);
+			if (bins.slots[cand[i]].tag != 0) FF_PREFETCH(bins.slots[cand[i]].ptr);
+		}
+		for (int i=0;i<nb;i++) {
+			const char* f0 = kp[i];
+			size_t n0 = kn[i];
+			const char* f1 = fp1[i];
+			size_t n1 = fn1[i];
+			bool has1 = fh1[i];
+			size_t s = cand[i];
+			while (bins.slots[s].tag != 0 && memcmp(bins.slots[s].ptr, f0, n0) != 0) {
+				s = bins.probe((s+1) & bins.mask, FFKeySet::tagOf(kh[i]), n0);
+			}
+			if (bins.slots[s].tag == 0) continue;
+			if (!has1 || n1 != 1 || (f1[0] != '0' && f1[0] != '1')) return 2;
+			if (used[s]) return 2;
+			used[s] = 1;
+			long long v = binValue[s];
+			if (v == FF_BIN_NONE) return 2;
+			int bi = (v >= 0 && v < 4096) ? smallBin[v] : -1;
+			if (bi < 0) {
+				std::unordered_map<long long,int>::iterator it = binIndex.find(v);
+				if (it == binIndex.end()) {
+					bi = (int)binList.size();
+					binIndex[v] = bi;
+					binList.push_back(FFRandBin());
+					binList.back().value = v;
+					binList.back().numPos = 0;
+				} else {
+					bi = it->second;
+				}
+				if (v >= 0 && v < 4096) smallBin[v] = bi;
+			}
+			if (f1[0] == '1') {
+				n++;
+				out.append(f0, n0);
+				out.append("\t1\n");
+				binList[bi].numPos++;
+			} else {
+				binList[bi].back.push_back(std::make_pair(f0, n0));
+			}
+		}
+	}
+
+	long long num = (long long)maxv - n;
+	if (num < n) {
+		fprintf(stderr, "Less background than target sequences!!!!!\n");
+	}
+	if (num < 1) {
+		fprintf(stderr, "Something is wrong - not enough background sequences!!!!\n");
+		return 0;
+	}
+	std::vector<std::pair<long long,int> > realBins;
+	long long totalPos = 0;
+	for (size_t i=0;i<binList.size();i++) {
+		if (binList[i].numPos < 1 || binList[i].back.size() < 1) continue;
+		totalPos += binList[i].numPos;
+		realBins.push_back(std::make_pair(-binList[i].value, (int)i));
+	}
+	std::sort(realBins.begin(), realBins.end());
+
+	FFPerlRand rnd(x1);
+	double leftover = 0.0;
+	for (size_t r=0;r<realBins.size();r++) {
+		FFRandBin &b = binList[realBins[r].second];
+		double num2add = floor((double)b.numPos/(double)totalPos*(double)num+0.49999999);
+		num2add += leftover;
+		leftover = 0.0;
+		long long nids = (long long)b.back.size();
+		long long z = 0;
+		if (num2add > (double)nids/2.0) {
+			// $ids{$_} = rand() for each ID, then a sort by value (all distinct)
+			std::vector<std::pair<double,long long> > keyed(nids);
+			for (long long i=0;i<nids;i++) keyed[i] = std::make_pair(rnd.next(), i);
+			std::stable_sort(keyed.begin(), keyed.end());
+			for (long long i=0;i<num2add;i++) {
+				if (i >= nids) break;
+				out.append(b.back[keyed[i].second].first, b.back[keyed[i].second].second);
+				out.append("\t0\n");
+				z++;
+			}
+		} else {
+			std::vector<char> mask(nids, 0);
+			while (z < num2add) {
+				double index = floor(rnd.next()*(double)nids);
+				if (index >= (double)nids) continue;
+				long long k = (long long)index;
+				if (mask[k]) continue;
+				mask[k] = 1;
+				out.append(b.back[k].first, b.back[k].second);
+				out.append("\t0\n");
+				z++;
+			}
+		}
+		if (z < num2add) leftover += num2add - z;
+	}
+	return 0;
+}
+
+void randBgProgram(int argc, char** argv) {
+	if (argc < 5) printCMDrandbg();
+	const char* x1Arg = NULL;
+	const char* x2Arg = NULL;
+	for (int i=5;i<argc;i++) {
+		if (strcmp(argv[i],"-perlrand")==0 && i+2 < argc) {
+			x1Arg = argv[++i];
+			x2Arg = argv[++i];
+		} else {
+			exit(2);
+		}
+	}
+	if (x1Arg == NULL) exit(2);
+	std::string out;
+	if (ffRandBg(argv[2], argv[3], argv[4], x1Arg, x2Arg, out) != 0) exit(2);
+	if (out.size() > 0) fwrite(out.data(), 1, out.size(), stdout);
+	fflush(stdout);
 }
