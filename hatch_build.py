@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import sysconfig
 import tempfile
 
@@ -37,9 +38,20 @@ SEQTAG_HEAD = '''#include "SeqTag.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#include <stdint.h>
+#endif
 static const char* homer2aoHome() {
 	static char path[4096];
+#ifdef __APPLE__
+	char raw[4096];
+	uint32_t size = sizeof(raw);
+	ssize_t n = -1;
+	if (_NSGetExecutablePath(raw, &size) == 0 && realpath(raw, path) != NULL) n = strlen(path);
+#else
 	ssize_t n = readlink("/proc/self/exe", path, sizeof(path)-2);
+#endif
 	if (n > 0) {
 		path[n] = '\\0';
 		for (int k = 0; k < 2; k++) {
@@ -179,7 +191,11 @@ class CustomBuildHook(BuildHookInterface):
 		jobs = os.environ.get('HOMER2_AO_BUILD_JOBS', str(min(4, os.cpu_count() or 1)))
 		cpp = os.path.join(home, 'cpp')
 		subprocess.run(['make', '-C', cpp, 'clean'], check=True, stdout=subprocess.DEVNULL)
-		subprocess.run(['make', '-C', cpp, '-j', jobs], check=True)
+		make = ['make', '-C', cpp, '-j', jobs]
+		if sys.platform == 'darwin':
+			# Motif2.cpp needs C++17, which Apple's compiler may not default to
+			make.append('COMPILER=g++ -std=gnu++17')
+		subprocess.run(make, check=True)
 		missing = [name for name in compiled_programs(root)
 			if not os.path.exists(os.path.join(home, 'bin', name))]
 		if missing:
