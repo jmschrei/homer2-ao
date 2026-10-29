@@ -47,6 +47,24 @@ was checked again on 2026-10-28:
   gave the same annotations; uninstalling removed the programs and kept `config.txt` and the
   genome.
 
+## Continuous integration
+
+`.github/workflows/tests.yml` builds homer2-ao and runs the 741 tests on every push: installed
+from source on x86-64 Linux, ARM Linux (both Ubuntu 24.04, g++ 13.3) and macOS on Apple silicon
+(Apple clang 21, Perl 5.44), built in place with `configureHomer.pl -make` on x86-64 Linux, and
+as manylinux wheels for x86-64 and ARM, each tested on its runner.
+
+The first runs found three things, each also present in HOMER v5.1 when built in place on the
+same runners:
+
+- On macOS, `HomerSVGLogo.pm` did not compile under Perl 5.44 (`docs/V5.1-DEFECTS.md`, entry
+  62); fixed.
+- On ARM Linux, `test_barcodes_quality` and `test_homer1_uses_the_original_homer` failed because
+  `char` is unsigned there (entry 63); the package build now uses `-fsigned-char`, and both pass.
+- On macOS, `test_pinned_default_motifs` found a different third motif: two candidates tie on
+  every statistic, and macOS's `qsort` picks the other one. v5.1 built on macOS picks the same
+  one as homer2-ao, and the test now expects it there.
+
 ## Every commit
 
 Each prefix of the `optimize` branch (v5.1 plus the commits up to that one) was built and run

@@ -36,12 +36,13 @@ uv pip install homer2-ao        # or: pip install homer2-ao
 uv tool install homer2-ao       # the commands on PATH, in an environment of their own
 ```
 
-HOMER's scripts need `perl`. On x86-64 Linux with glibc 2.27 or later (most distributions
-released since 2018), the package comes with HOMER's programs already compiled. On other Linux
-systems it compiles them during installation (macOS has not been tested), which needs `make` and
-a C++ compiler whose default language standard is C++17 or later (GCC 11 or later, or Clang).
-Every HOMER program and script is installed as a command of the same name. From a clone of this
-repository, `uv pip install .` compiles and installs it the same way.
+HOMER's scripts need `perl`. On x86-64 and ARM Linux with glibc 2.28 or later (most
+distributions released since 2019), the package comes with HOMER's programs already compiled.
+Elsewhere, macOS included, it compiles them during installation, which needs `make` and a C++17
+compiler (GCC 11 or later, or Clang; on macOS, the Xcode command line tools). Continuous
+integration tests x86-64 and ARM Linux and macOS on Apple silicon. Every HOMER program and
+script is installed as a command of the same name. From a clone of this repository, `uv pip
+install .` compiles and installs it the same way.
 
 The repository is also a complete HOMER tree, and can be built the way HOMER is, in place:
 
@@ -107,8 +108,8 @@ with v5.1's beyond these tests is in `docs/VALIDATION.md`.
 
 ## Defects in v5.1
 
-The tests and comparisons found 61 defects in HOMER v5.1 itself, listed with reproductions in
-`docs/V5.1-DEFECTS.md`. homer2-ao fixes 3 of them and behaves differently in 4 (also in
+The tests and comparisons found 63 defects in HOMER v5.1 itself, listed with reproductions in
+`docs/V5.1-DEFECTS.md`. homer2-ao fixes 5 of them and behaves differently in 4 (also in
 `docs/DIFFERENCES.md`); 41 are unchanged, most in code homer2-ao does not touch, and 13 were not
 checked.
 

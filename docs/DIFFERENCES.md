@@ -38,10 +38,12 @@ gives the same information for its own change.
   0 and reports every motif in 100% of targets and background. Neither result is meaningful.
 - **`homer2 denovo -len -1`** crashes in both: v5.1 aborts (exit status 134), homer2-ao segfaults
   (139).
-- **Tied sort keys in `homer2 denovo`.** homer2-ao sorts with `std::stable_sort`, which gave
-  glibc `qsort`'s order in all 2,748 sorts of a 10,000-peak run. On another C library (macOS, not
-  tested), v5.1's order on tied keys may differ from glibc's, and so may its output from
-  homer2-ao's.
+- **Tied sort keys in `homer2 denovo`.** homer2-ao sorts oligos with `std::stable_sort`, which
+  gave glibc `qsort`'s order in all 2,748 sorts of a 10,000-peak run. Other sorts, such as the
+  final motif list, still use the C library's `qsort`, whose order for ties differs on macOS: in
+  one test two candidate motifs tie on every statistic, and v5.1 and homer2-ao both report the
+  same one on macOS and the other on Linux. Output on macOS was not compared with v5.1 beyond the
+  test suite.
 
 ## stderr
 
@@ -88,13 +90,22 @@ place of `configureHomer.pl -make`, so that the installed package works wherever
   `subtractBedGraphsDirectory.pl`); configureHomer.pl leaves them as they are, and the package
   rewrites them too.
 - `cpp/SeqTag.cpp`, whose first lines configureHomer.pl rewrites with the install path, finds the
-  installation from the running program's path (`/proc/self/exe`), or from `HOMER2_AO_HOME`,
-  which the package's commands set.
-- The compiled programs have their debug information stripped.
+  installation from the running program's path (`/proc/self/exe` on Linux,
+  `_NSGetExecutablePath` on macOS), or from `HOMER2_AO_HOME`, which the package's commands set.
+- The compiled programs have their debug information stripped. On Linux other than x86-64 they
+  are compiled with `-fsigned-char`, because HOMER's code assumes a signed `char`
+  (`docs/V5.1-DEFECTS.md`, entry 63); on macOS with `-std=gnu++17`. The x86-64 Linux build uses
+  the Makefile's flags unchanged.
 - The package ships the `config.txt` that `configureHomer.pl -install` writes for a fresh tree
   as `config.default.txt`, and its commands copy it to `config.txt` on first use. pip and uv
   therefore do not own `config.txt`, so an upgrade keeps it and the genomes it lists.
 - The package leaves out `update/`, `bin/old/`, `cpp/backup/` and the Doughnut documentation PDF.
+
+## Outside the optimization
+
+- `bin/HomerSVGLogo.pm` calls `plotXY` as a function where v5.1 wrote `$plotXY(...)`, which Perl
+  5.44 does not compile (`docs/V5.1-DEFECTS.md`, entry 62). Nothing calls that function, so no
+  output changes.
 
 ## Building
 
@@ -103,5 +114,6 @@ place of `configureHomer.pl -make`, so that the installed package works wherever
   `__builtin_popcount` and `vector_size`, which GCC and Clang provide.
 - `compareMotifMatrices.cpp` is compiled with `-ffp-contract=off`, so its scores match Perl's
   arithmetic bit for bit.
-- The build uses no CPU-specific or fast-math flags. It has been built and tested with GCC 13
-  and Clang on x86-64 Linux; macOS and other architectures have not been tried.
+- The build uses no CPU-specific or fast-math flags. Continuous integration builds it and runs
+  the tests on x86-64 and ARM Linux (GCC 13) and on macOS on Apple silicon (Apple clang 21). The
+  byte-for-byte comparisons with v5.1 in `docs/VALIDATION.md` were run on x86-64 Linux.
