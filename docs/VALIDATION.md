@@ -41,6 +41,11 @@ was checked again on 2026-10-28:
   other, `test_options_passed_to_homer2_denovo[dn_e]`, checks that `-e 1` changes the de novo
   motifs on the test data. With Perl 5.26.3 the run with `-e 1` finds the same motifs as the
   run without it, and v5.1 built in the same environment fails that test the same way.
+- Through the package's commands, `configureHomer.pl -install sacCer3` installed the yeast
+  genome, and `annotatePeaks.pl` and `findMotifsGenome.pl` then ran with it by name. After the
+  package was reinstalled, the genome was still listed in `config.txt` and `annotatePeaks.pl`
+  gave the same annotations; uninstalling removed the programs and kept `config.txt` and the
+  genome.
 
 ## Every commit
 
