@@ -9,6 +9,11 @@
 >
 > HOMER and its documentation: http://homer.ucsd.edu/homer/
 
+> [!IMPORTANT]
+> homer2-ao is provided as is and will not be maintained going forward. Only bugs in the changes
+> made by the auto-optimization (the commits on the `optimize` branch) will be fixed; it will not
+> follow new HOMER releases.
+
 homer2-ao is HOMER v5.1 with faster motif scanning and motif finding. `homer2` (`find`, `known`,
 `denovo`, `norm`, `mask`), `findMotifsGenome.pl` and `compareMotifs.pl` give the same output files
 as HOMER v5.1, byte for byte, in a small fraction of the time. Every HOMER program keeps its name
