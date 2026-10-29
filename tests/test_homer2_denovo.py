@@ -30,6 +30,7 @@ Expected values are derived independently:
 import collections
 import itertools
 import os
+import sys
 
 import pytest
 
@@ -373,8 +374,11 @@ def test_pinned_default_motifs(runs):
 
 	got = [(m.consensus, len(m), header_stats(m)[1], header_stats(m)[3])
 		for m in motifs_of(runs, 'default')]
+	# Two candidates for the third motif tie on every statistic, and qsort
+	# picks between them; macOS's qsort picks the other one, in v5.1 too.
+	third = 'CATGGTGC' if sys.platform == 'darwin' else 'GGAGCTGT'
 	assert got == [('TASCGTAC', 8, 121.0, 6.0), ('TAAGGATC', 8, 80.0, 3.0),
-		('GGAGCTGT', 8, 61.0, 2.0)]
+		(third, 8, 61.0, 2.0)]
 
 
 # --- inputs and outputs -----------------------------------------------------------------
