@@ -24,6 +24,11 @@ jobs:
 
       - uses: astral-sh/setup-uv@v10.3.3
 
+      - name: Toolchain
+        run: |
+          perl -v | sed -n 2p
+          g++ --version | head -1
+
       - name: Install homer2-ao from source
         run: |
           uv venv --python 3.12

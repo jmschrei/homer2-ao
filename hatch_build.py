@@ -13,6 +13,7 @@ command of the same name.
 """
 
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -192,9 +193,15 @@ class CustomBuildHook(BuildHookInterface):
 		cpp = os.path.join(home, 'cpp')
 		subprocess.run(['make', '-C', cpp, 'clean'], check=True, stdout=subprocess.DEVNULL)
 		make = ['make', '-C', cpp, '-j', jobs]
+		flags = []
 		if sys.platform == 'darwin':
 			# Motif2.cpp needs C++17, which Apple's compiler may not default to
-			make.append('COMPILER=g++ -std=gnu++17')
+			flags.append('-std=gnu++17')
+		elif platform.machine() not in ('x86_64', 'AMD64', 'i686'):
+			# HOMER's code assumes char is signed, as on x86; on ARM Linux it is not
+			flags.append('-fsigned-char')
+		if flags:
+			make.append('COMPILER=g++ ' + ' '.join(flags))
 		subprocess.run(make, check=True)
 		missing = [name for name in compiled_programs(root)
 			if not os.path.exists(os.path.join(home, 'bin', name))]
