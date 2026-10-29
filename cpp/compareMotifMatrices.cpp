@@ -11,7 +11,7 @@
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
-
+// Added in October 2026 for homer2-ao, from compareMotifs.pl's code.
 // compareMotifMatrices: compareMotifs.pl's compareMotifsRehli with the
 // correlation score, for many motif pairs at once (called by compareMotifs.pl).
 //

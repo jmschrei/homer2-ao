@@ -16,7 +16,7 @@ my $homeDir = "/gpfs/data01/cbenner/software/homer/./";
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
-
+# Modified in October 2026 for homer2-ao: background selection through homerTools, -p passed to homer2 norm, and the longest de novo length run beside the rest.
 
 use POSIX;
 use HomerConfig;

@@ -3,7 +3,7 @@ DEBUG = -O3 -Wall -g
 #DEBUG = -O3 -Wall
 #DEBUG = -O3 -march=pentium4 -fomit-frame-pointer
 #DEBUG = -O3 -D_FILE_OFFSET_BITS=64
-
+# Modified in October 2026 for homer2-ao: builds compareMotifMatrices.
 #for linux
 COMPILER = g++
 LIBRARIES = -lpthread -lstdc++ -lm

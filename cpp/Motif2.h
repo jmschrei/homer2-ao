@@ -1,4 +1,4 @@
-
+// Modified in October 2026 for homer2-ao: data structures for faster motif scanning and de novo motif finding.
 // Copyright 2009, 2010, 2011, 2012 Christopher Benner <cbenner@gmail.com>
 // 
 // This file is part of HOMER

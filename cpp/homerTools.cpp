@@ -1,4 +1,4 @@
-
+// Modified in October 2026 for homer2-ao: the bgbins, randbg and filterids commands.
 // Copyright 2009 - 2016 Christopher Benner <cbenner@ucsd.edu>
 // 
 // This file is part of HOMER

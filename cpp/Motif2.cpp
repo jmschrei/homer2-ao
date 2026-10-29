@@ -1,4 +1,4 @@
-
+// Modified in October 2026 for homer2-ao: faster motif scanning, de novo motif finding and autonormalization, with output unchanged.
 // Copyright 2009 - 2014 Christopher Benner <cbenner@salk.edu>
 // 
 // This file is part of HOMER

@@ -2,7 +2,7 @@
 use warnings;
 use lib "/gpfs/data01/cbenner/software/homer/.//bin";
 my $homeDir = "/gpfs/data01/cbenner/software/homer/./";
-
+# Modified in October 2026 for homer2-ao: motif pairs scored by compareMotifMatrices when it is installed.
 my $promoterSeqOffset = -2000;
 
 use POSIX;
