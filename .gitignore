@@ -34,7 +34,11 @@ bin/makeUCSCfile
 bin/mergePeaks
 
 # Written by hand after configuring; HOMER's scripts stop without it
-config.txt
+/config.txt
 
 __pycache__/
 .pytest_cache/
+
+# Written into the tree a benchmark builds
+.paired-cache/
+.bench-built
