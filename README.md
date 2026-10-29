@@ -54,8 +54,9 @@ homer2 find -i peaks.fa -m known.motifs -p 8 -o sites.txt
 ```
 
 A genome can be given as a FASTA file, as above, or installed by name into the package's HOMER
-directory with `configureHomer.pl -install hg38`. `homer2-ao` prints the version and that
-directory, and `homer2-ao <program> [args]` runs a HOMER program by name. From Python,
+directory with `configureHomer.pl -install hg38`. Installed genomes, and the `config.txt` that
+lists them, stay in place when the package is upgraded or uninstalled. `homer2-ao` prints the
+version and that directory, and `homer2-ao <program> [args]` runs a HOMER program by name. From Python,
 `homer2_ao.home()` and `homer2_ao.bin_dir()` give the same locations.
 
 ## What changed

@@ -91,8 +91,10 @@ place of `configureHomer.pl -make`, so that the installed package works wherever
   installation from the running program's path (`/proc/self/exe`), or from `HOMER2_AO_HOME`,
   which the package's commands set.
 - The compiled programs have their debug information stripped.
-- The package ships a fresh `config.txt`, as `configureHomer.pl -install` writes it, and leaves
-  out `update/`, `bin/old/`, `cpp/backup/` and the Doughnut documentation PDF.
+- The package ships the `config.txt` that `configureHomer.pl -install` writes for a fresh tree
+  as `config.default.txt`, and its commands copy it to `config.txt` on first use. pip and uv
+  therefore do not own `config.txt`, so an upgrade keeps it and the genomes it lists.
+- The package leaves out `update/`, `bin/old/`, `cpp/backup/` and the Doughnut documentation PDF.
 
 ## Building
 

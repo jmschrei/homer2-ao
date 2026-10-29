@@ -57,7 +57,9 @@ const char* HomerConfig::homeDirectory = homer2aoHome();
 
 '''
 
-# configureHomer.pl -install writes this for a fresh tree.
+# configureHomer.pl -install writes this for a fresh tree. The wheel ships it as
+# config.default.txt and the launcher copies it to config.txt on first use, so
+# that pip and uv do not own config.txt and an upgrade keeps installed genomes.
 CONFIG = ('# Homer Configuration File (automatically generated)\n#\n\nSOFTWARE\n'
 	'homer\tv5.1\tCode/Executables, ontologies, motifs for HOMER\t'
 	'http://homer.ucsd.edu/homer/data/software/homer.v5.1.zip\t./\t\n\n'
@@ -168,7 +170,7 @@ class CustomBuildHook(BuildHookInterface):
 		shutil.copytree(os.path.join(root, 'motifs'), os.path.join(home, 'motifs'))
 		for name in ('configureHomer.pl', 'COPYING', 'README.txt'):
 			shutil.copy2(os.path.join(root, name), os.path.join(home, name))
-		with open(os.path.join(home, 'config.txt'), 'w') as handle:
+		with open(os.path.join(home, 'config.default.txt'), 'w') as handle:
 			handle.write(CONFIG)
 
 		configure_scripts(os.path.join(home, 'bin'), set(configure_list(root)))
