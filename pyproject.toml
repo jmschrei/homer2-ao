@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "homer2-ao"
+dynamic = ["version", "scripts"]
+description = "HOMER v5.1 with faster motif scanning and motif finding, output identical to v5.1."
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["COPYING"]
+requires-python = ">=3.9"
+authors = [
+    { name = "Christopher Benner" },
+]
+maintainers = [
+    { name = "Jacob Schreiber", email = "jmschreiber91@gmail.com" },
+]
+keywords = [
+    "genomics",
+    "bioinformatics",
+    "motifs",
+    "HOMER",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Programming Language :: Perl",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/jmschrei/homer2-ao"
+Repository = "https://github.com/jmschrei/homer2-ao"
+HOMER = "http://homer.ucsd.edu/homer/"
+
+[tool.hatch.version]
+path = "homer2_ao/__init__.py"
+
+[tool.hatch.metadata.hooks.custom]
+
+[tool.hatch.build.targets.wheel]
+packages = ["homer2_ao"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/homer2_ao",
+    "/hatch_build.py",
+    "/pyproject.toml",
+    "/README.md",
+    "/README.txt",
+    "/COPYING",
+    "/configureHomer.pl",
+    "/bin/*.pl",
+    "/bin/*.pm",
+    "/cpp",
+    "/data",
+    "/motifs",
+]
+exclude = [
+    "/cpp/backup",
+    "/cpp/*.o",
+    "/data/genomes",
+    "/data/promoters",
+    "/data/organisms",
+]

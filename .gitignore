@@ -42,3 +42,9 @@ __pycache__/
 # Written into the tree a benchmark builds
 .paired-cache/
 .bench-built
+
+# Python packaging
+/dist/
+/build/
+*.egg-info/
+.ipynb_checkpoints/

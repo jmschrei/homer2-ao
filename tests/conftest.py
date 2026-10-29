@@ -112,6 +112,8 @@ def homer_install():
 		found = re.search(r'my \$homeDir = "([^"]*)"', head)
 		configured = bool(found) and os.path.realpath(found.group(1)) == \
 			os.path.realpath(hh.HOMER_HOME)
+		# the pip package's scripts find their directory at run time
+		configured = configured or 'my $homeDir = Cwd::abs_path(' in head
 	if missing or not configured:
 		pytest.exit('HOMER_HOME={} is not a built HOMER install: run '
 			'"perl configureHomer.pl -make" there, or point HOMER_HOME at one '
