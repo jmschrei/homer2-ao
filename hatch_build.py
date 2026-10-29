@@ -219,8 +219,8 @@ class CustomBuildHook(BuildHookInterface):
 
 		build_data['force_include'][home] = 'homer2_ao/homer'
 		build_data['pure_python'] = False
-		platform = sysconfig.get_platform().replace('-', '_').replace('.', '_')
-		build_data['tag'] = 'py3-none-' + platform
+		plat = sysconfig.get_platform().replace('-', '_').replace('.', '_')
+		build_data['tag'] = 'py3-none-' + plat
 
 	def finalize(self, version, build_data, artifact_path):
 		if getattr(self, 'stage', None):
