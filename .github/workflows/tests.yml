@@ -1,0 +1,85 @@
+# Builds homer2-ao from source and runs the tests on x86-64 and ARM Linux and
+# on macOS, tests HOMER's own in-place build, and builds the manylinux wheels
+# and tests each one on its runner.
+
+name: Tests
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  source:
+    name: Source install, ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.3.3
+
+      - name: Install homer2-ao from source
+        run: |
+          uv venv --python 3.12
+          uv pip install . pytest
+
+      - name: Test the installed package
+        run: |
+          export HOMER_HOME=$(.venv/bin/homer2-ao --home)
+          .venv/bin/python -m pytest -q tests
+
+  in-place:
+    name: In-place build, ubuntu-latest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.3.3
+
+      - name: Build with configureHomer.pl
+        run: |
+          perl configureHomer.pl -make
+          touch config.txt
+
+      - name: Test the in-place build
+        run: uv run --no-project --python 3.12 --with pytest python -m pytest -q tests
+
+  wheels:
+    name: manylinux wheel, ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v7
+
+      # The wheel holds compiled programs, not a Python extension, so one
+      # build serves every Python version.
+      - name: Build the wheel in manylinux_2_28
+        uses: pypa/cibuildwheel@v4.3.5
+        env:
+          CIBW_BUILD: cp312-manylinux_*
+          CIBW_ARCHS: native
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
+
+      - uses: astral-sh/setup-uv@v10.3.3
+
+      - name: Test the wheel on the runner
+        run: |
+          uv venv --python 3.12
+          uv pip install wheelhouse/*.whl pytest
+          export HOMER_HOME=$(.venv/bin/homer2-ao --home)
+          .venv/bin/python -m pytest -q tests
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-${{ matrix.os }}
+          path: wheelhouse/*.whl
