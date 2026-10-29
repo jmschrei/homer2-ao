@@ -7,6 +7,8 @@
 > required for macrophage and B cell identities. *Molecular Cell* 38(4):576-589 (2010).
 > https://doi.org/10.1016/j.molcel.2010.05.004
 >
+> This is a scholarly request, not a condition of the license (GPL-3.0-or-later).
+>
 > HOMER and its documentation: http://homer.ucsd.edu/homer/
 
 > [!IMPORTANT]
