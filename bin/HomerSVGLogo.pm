@@ -3,7 +3,7 @@ use warnings;
 
 
 package HomerSVGLogo;
-
+# Modified in October 2026 for homer2-ao: plotXY_TSV calls plotXY as a function, which every Perl compiles.
 my $defWidth=25;
 my $defHeight=50;
 my $defFont = "Arial";
@@ -160,7 +160,7 @@ sub plotXY_TSV {
 	}
 	close IN;
 	
-	return $plotXY(\@data,$xlabel,$ylabel,\@seriesLabels,$xlow,$xhigh,$ylow,$yhigh);
+	return plotXY(\@data,$xlabel,$ylabel,\@seriesLabels,$xlow,$xhigh,$ylow,$yhigh);
 }
 
 sub plotXY {
